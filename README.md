@@ -19,10 +19,10 @@ in `sidecar/` is that process. It is titled `Ladybird` and still has a
 headless screenshot fallback (slow: one process per navigate).
 
 The overlay (`Guest/Suzuri/`) is the live path: one Ladybird, `navigate`
-calls `loadURL`, `scroll` wheels the WebView, and each compositor frame
-copies the **viewport** into SZFB. Point the manifest `command` at the
-Ladybird binary after `scripts/apply.sh`. Pass `--temporary-profile` so
-the guest does not join a desktop Ladybird.
+calls `loadURL`, `scroll` / `pointer` / `key` go to the WebView, and
+changed viewport frames copy into SZFB. Point the manifest `command` at
+the Ladybird binary after `scripts/apply.sh`. Pass `--temporary-profile`
+so the guest does not join a desktop Ladybird.
 
 MCP (eval / screenshot / click) stays later, inside this process.
 

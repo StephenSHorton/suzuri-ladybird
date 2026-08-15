@@ -23,6 +23,8 @@ struct HostMessage {
         Focus,
         Navigate,
         Scroll,
+        Pointer,
+        Key,
         Draft,
         Stack,
         Kill,
@@ -36,6 +38,12 @@ struct HostMessage {
     std::string url;
     bool focus_in { false };
     double dy { 0 };
+    std::string kind;
+    int button { 0 };
+    int buttons { 0 };
+    int modifiers { 0 };
+    std::string key;
+    std::string text;
     std::optional<Framebuffer> fb;
 };
 

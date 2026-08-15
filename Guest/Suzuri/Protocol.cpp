@@ -229,6 +229,10 @@ HostMessage parse_host_line(std::string const& line)
         m.type = HostMessage::Type::Navigate;
     else if (type == "scroll")
         m.type = HostMessage::Type::Scroll;
+    else if (type == "pointer")
+        m.type = HostMessage::Type::Pointer;
+    else if (type == "key")
+        m.type = HostMessage::Type::Key;
     else if (type == "draft")
         m.type = HostMessage::Type::Draft;
     else if (type == "stack")
@@ -250,6 +254,15 @@ HostMessage parse_host_line(std::string const& line)
         m.rect.h = static_cast<float>(*h);
     if (auto dy = json_number(line, "dy"))
         m.dy = *dy;
+    m.kind = json_string(line, "kind").value_or("");
+    m.key = json_string(line, "key").value_or("");
+    m.text = json_string(line, "text").value_or("");
+    if (auto b = json_number(line, "button"))
+        m.button = static_cast<int>(*b);
+    if (auto b = json_number(line, "buttons"))
+        m.buttons = static_cast<int>(*b);
+    if (auto mods = json_number(line, "modifiers"))
+        m.modifiers = static_cast<int>(*mods);
     if (auto path = json_string(line, "path")) {
         Framebuffer fb;
         fb.path = *path;

@@ -10,6 +10,8 @@
 #include <LibGfx/Rect.h>
 #include <LibWeb/HTML/ActivateTab.h>
 #include <LibWeb/Page/InputEvent.h>
+#include <LibWeb/UIEvents/KeyCode.h>
+#include <LibWeb/UIEvents/MouseButton.h>
 #include <LibWebView/ViewImplementation.h>
 
 #include <algorithm>
@@ -46,6 +48,8 @@ struct GuestRuntime {
     bool observers { false };
     bool timer { false };
     int no_tab_logs { 0 };
+    bool force_blit { false };
+    std::uint32_t blit_hash { 0 };
 };
 
 GuestRuntime g_rt;
@@ -79,6 +83,8 @@ Tab* active_tab()
         return nil;
     if (auto* tab = [delegate activeTab])
         return tab;
+    if ([delegate tabCount] > 0)
+        return nil;
     if (g_rt.no_tab_logs < 8) {
         slog("no tab — creating");
         ++g_rt.no_tab_logs;
@@ -159,8 +165,8 @@ bool blit_viewport()
         return false;
 
     auto now = std::chrono::steady_clock::now();
-    if (g_rt.last_blit.time_since_epoch().count() != 0
-        && now - g_rt.last_blit < std::chrono::milliseconds(16))
+    if (!g_rt.force_blit && g_rt.last_blit.time_since_epoch().count() != 0
+        && now - g_rt.last_blit < std::chrono::milliseconds(33))
         return false;
 
     auto paintable = bridge->paintable();
@@ -188,18 +194,31 @@ bool blit_viewport()
 
     std::vector<std::uint8_t> px(static_cast<std::size_t>(dst_w) * dst_h * 4, 0);
     auto const row_bytes = static_cast<std::size_t>(copy_w) * 4;
+    std::uint32_t hash = 2166136261u;
     for (int y = 0; y < copy_h; ++y) {
         auto const* src = bitmap->scanline_u8(y);
         if (!src)
             continue;
         std::memcpy(px.data() + static_cast<std::size_t>(y) * dst_w * 4, src, row_bytes);
+        if ((y & 7) == 0) {
+            auto const* px32 = reinterpret_cast<std::uint32_t const*>(src);
+            hash ^= px32[0];
+            hash *= 16777619u;
+            hash ^= px32[static_cast<unsigned>(copy_w - 1)];
+            hash *= 16777619u;
+        }
     }
 
     if (surf)
         IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, nullptr);
 
+    if (!g_rt.force_blit && hash == g_rt.blit_hash)
+        return false;
+
     if (!Suzuri::write_szfb(g_rt.fb, px))
         return false;
+    g_rt.blit_hash = hash;
+    g_rt.force_blit = false;
     g_rt.last_blit = now;
     send_surface();
     return true;
@@ -350,6 +369,107 @@ void scroll_by(double dy)
     event.screen_position = { x, y };
     event.button = Web::UIEvents::MouseButton::Middle;
     event.wheel_delta_y = dy;
+    g_rt.force_blit = true;
+    g_rt.last_blit = {};
+    bridge->enqueue_input_event(move(event));
+}
+
+Web::UIEvents::MouseButton mouse_button_from_code(int code)
+{
+    return Web::UIEvents::button_code_to_mouse_button(static_cast<i16>(code));
+}
+
+void pointer_at(Suzuri::HostMessage const& msg)
+{
+    ensure_view();
+    auto* bridge = bridge_for(active_tab());
+    if (!bridge)
+        return;
+
+    Web::MouseEvent::Type type = Web::MouseEvent::Type::MouseMove;
+    if (msg.kind == "down")
+        type = Web::MouseEvent::Type::MouseDown;
+    else if (msg.kind == "up")
+        type = Web::MouseEvent::Type::MouseUp;
+    else if (msg.kind == "leave")
+        type = Web::MouseEvent::Type::MouseLeave;
+
+    auto button = mouse_button_from_code(msg.button);
+    if (type == Web::MouseEvent::Type::MouseMove && msg.buttons == 0)
+        button = Web::UIEvents::MouseButton::None;
+
+    Web::MouseEvent event;
+    event.type = type;
+    event.position = { static_cast<int>(msg.rect.x), static_cast<int>(msg.rect.y) };
+    event.screen_position = event.position;
+    event.button = button;
+    event.buttons = static_cast<Web::UIEvents::MouseButton>(msg.buttons);
+    event.modifiers = static_cast<Web::UIEvents::KeyModifier>(msg.modifiers);
+    if (type == Web::MouseEvent::Type::MouseDown || type == Web::MouseEvent::Type::MouseUp)
+        event.click_count = 1;
+    slog("pointer %s %.1f,%.1f btn=%d", msg.kind.c_str(), msg.rect.x, msg.rect.y, msg.button);
+    g_rt.force_blit = true;
+    g_rt.last_blit = {};
+    bridge->enqueue_input_event(move(event));
+}
+
+Web::UIEvents::KeyCode key_from_name(std::string const& name, std::string const& text)
+{
+    if (name == "Enter" || name == "Return")
+        return Web::UIEvents::KeyCode::Key_Return;
+    if (name == "Backspace")
+        return Web::UIEvents::KeyCode::Key_Backspace;
+    if (name == "Tab")
+        return Web::UIEvents::KeyCode::Key_Tab;
+    if (name == "Escape")
+        return Web::UIEvents::KeyCode::Key_Escape;
+    if (name == "ArrowLeft" || name == "Left")
+        return Web::UIEvents::KeyCode::Key_Left;
+    if (name == "ArrowRight" || name == "Right")
+        return Web::UIEvents::KeyCode::Key_Right;
+    if (name == "ArrowUp" || name == "Up")
+        return Web::UIEvents::KeyCode::Key_Up;
+    if (name == "ArrowDown" || name == "Down")
+        return Web::UIEvents::KeyCode::Key_Down;
+    if (name == "Home")
+        return Web::UIEvents::KeyCode::Key_Home;
+    if (name == "End")
+        return Web::UIEvents::KeyCode::Key_End;
+    if (name == "PageUp")
+        return Web::UIEvents::KeyCode::Key_PageUp;
+    if (name == "PageDown")
+        return Web::UIEvents::KeyCode::Key_PageDown;
+    if (name == "Delete")
+        return Web::UIEvents::KeyCode::Key_Delete;
+    if (name == "Space" || text == " ")
+        return Web::UIEvents::KeyCode::Key_Space;
+    auto ch = text.empty() ? (name.empty() ? 0 : name[0]) : text[0];
+    if (ch >= 'a' && ch <= 'z')
+        return static_cast<Web::UIEvents::KeyCode>(static_cast<int>(Web::UIEvents::KeyCode::Key_A) + (ch - 'a'));
+    if (ch >= 'A' && ch <= 'Z')
+        return static_cast<Web::UIEvents::KeyCode>(static_cast<int>(Web::UIEvents::KeyCode::Key_A) + (ch - 'A'));
+    if (ch >= '0' && ch <= '9')
+        return static_cast<Web::UIEvents::KeyCode>(static_cast<int>(Web::UIEvents::KeyCode::Key_0) + (ch - '0'));
+    return Web::UIEvents::KeyCode::Key_Invalid;
+}
+
+void send_key(Suzuri::HostMessage const& msg)
+{
+    ensure_view();
+    auto* bridge = bridge_for(active_tab());
+    if (!bridge)
+        return;
+
+    Web::KeyEvent event;
+    event.type = msg.kind == "up" ? Web::KeyEvent::Type::KeyUp : Web::KeyEvent::Type::KeyDown;
+    event.key = key_from_name(msg.key, msg.text);
+    event.modifiers = static_cast<Web::UIEvents::KeyModifier>(msg.modifiers);
+    if (!msg.text.empty()) {
+        event.code_point = static_cast<u32>(static_cast<unsigned char>(msg.text[0]));
+        event.should_insert_text = event.type == Web::KeyEvent::Type::KeyDown;
+    }
+    g_rt.force_blit = true;
+    g_rt.last_blit = {};
     bridge->enqueue_input_event(move(event));
 }
 
@@ -365,6 +485,12 @@ void handle_host(Suzuri::HostMessage const& msg)
         break;
     case Suzuri::HostMessage::Type::Scroll:
         scroll_by(msg.dy);
+        break;
+    case Suzuri::HostMessage::Type::Pointer:
+        pointer_at(msg);
+        break;
+    case Suzuri::HostMessage::Type::Key:
+        send_key(msg);
         break;
     case Suzuri::HostMessage::Type::Focus:
     case Suzuri::HostMessage::Type::Draft:
