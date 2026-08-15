@@ -96,44 +96,17 @@ bool write_szfb(Framebuffer& fb, std::vector<std::uint8_t> const& bgra)
     return true;
 }
 
-void paint_placeholder(Framebuffer& fb, std::string const& url)
+void paint_placeholder(Framebuffer& fb, std::string const&)
 {
     auto const w = static_cast<std::size_t>(fb.width);
     auto const h = static_cast<std::size_t>(fb.height);
     if (w == 0 || h == 0)
         return;
+    // Same well as a Suzuri leaf — no browser chrome while the page loads.
     std::vector<std::uint8_t> px(w * h * 4);
-    std::uint32_t hash = 2166136261u;
-    for (unsigned char c : url) {
-        hash ^= c;
-        hash *= 16777619u;
-    }
-    std::uint8_t const rail[4] = { 36, 92, 232, 255 };
     std::uint8_t const fill[4] = { 18, 16, 12, 255 };
-    std::uint8_t const bar[4] = { 32, 48, 72, 255 };
-    std::uint8_t const stripe[4] = {
-        static_cast<std::uint8_t>(20 + (hash & 0x3f)),
-        static_cast<std::uint8_t>(60 + ((hash >> 8) & 0x3f)),
-        static_cast<std::uint8_t>(160 + ((hash >> 16) & 0x3f)),
-        255,
-    };
-    auto const rail_w = std::min<std::size_t>(8, w);
-    auto const bar_h = std::min<std::size_t>(6, h);
-    auto const band_y = std::min<std::size_t>(16, h ? h - 1 : 0);
-    auto const band_h = std::min<std::size_t>(4, h > band_y ? h - band_y : 0);
-    for (std::size_t y = 0; y < h; ++y) {
-        for (std::size_t x = 0; x < w; ++x) {
-            auto const* c = fill;
-            if (x < rail_w)
-                c = rail;
-            else if (y < bar_h)
-                c = bar;
-            else if (y >= band_y && y < band_y + band_h)
-                c = stripe;
-            auto i = (y * w + x) * 4;
-            std::memcpy(px.data() + i, c, 4);
-        }
-    }
+    for (std::size_t i = 0; i < w * h; ++i)
+        std::memcpy(px.data() + i * 4, fill, 4);
     write_szfb(fb, px);
 }
 

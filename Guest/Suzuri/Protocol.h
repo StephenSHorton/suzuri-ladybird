@@ -53,7 +53,7 @@ public:
     using Handler = std::function<void(HostMessage const&)>;
 
     bool connect(std::uint16_t port);
-    void send_hello(std::string const& title = "Ladybird");
+    void send_hello(std::string const& title = "guest");
     void send_title(std::string const& text);
     void send_url(std::string const& text);
     void send_busy(bool busy);

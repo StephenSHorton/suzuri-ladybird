@@ -25,6 +25,7 @@
 #include <vector>
 
 #import <Cocoa/Cocoa.h>
+#import <CoreGraphics/CGWindow.h>
 #import <IOSurface/IOSurface.h>
 
 #if !__has_feature(objc_arc)
@@ -58,6 +59,41 @@ bool g_is_guest { false };
 
 Tab* active_tab();
 
+// Covered by Suzuri chrome so it is not a second browser, but still on a
+// real display so WebContent composites. Off-screen + occlusion = blank well.
+void park_under_host(NSWindow* window, CGFloat css_w, CGFloat css_h)
+{
+    CGWindowID host = kCGNullWindowID;
+    CGRect host_b {};
+    CFArrayRef info = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID);
+    for (NSDictionary* w in (__bridge NSArray*)info) {
+        NSString* owner = w[(id)kCGWindowOwnerName];
+        if (![owner isEqualToString:@"suzuri-chrome"] && ![owner isEqualToString:@"suzuri"])
+            continue;
+        host = (CGWindowID)[w[(id)kCGWindowNumber] unsignedIntValue];
+        CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(id)kCGWindowBounds], &host_b);
+        if ([owner isEqualToString:@"suzuri-chrome"])
+            break;
+    }
+    if (info)
+        CFRelease(info);
+
+    auto w = css_w > 80 ? css_w : 800;
+    auto h = css_h > 80 ? css_h : 600;
+    if (host != kCGNullWindowID) {
+        NSScreen* screen = [NSScreen mainScreen];
+        CGFloat sh = NSMaxY(screen.frame);
+        CGFloat x = host_b.origin.x + 12;
+        CGFloat y = sh - (host_b.origin.y + host_b.size.height) + 56;
+        NSRect want = NSMakeRect(x, y, w, h);
+        if (!NSEqualRects(NSIntegralRect([window frame]), NSIntegralRect(want)))
+            [window setFrame:want display:YES];
+        [window orderWindow:NSWindowBelow relativeTo:static_cast<NSInteger>(host)];
+    } else {
+        [window setFrame:NSMakeRect(-20000, -20000, w, h) display:NO];
+    }
+}
+
 void hide_guest_window(NSWindow* window)
 {
     if (window == nil)
@@ -67,19 +103,15 @@ void hide_guest_window(NSWindow* window)
     [window setExcludedFromWindowsMenu:YES];
     [window setHasShadow:NO];
     [window setIgnoresMouseEvents:YES];
-    [window setAlphaValue:0];
+    [window setAlphaValue:1];
     [window setCollectionBehavior:NSWindowCollectionBehaviorTransient
             | NSWindowCollectionBehaviorIgnoresCycle
             | NSWindowCollectionBehaviorStationary
             | NSWindowCollectionBehaviorCanJoinAllSpaces];
-    // Keep a window (off-screen). orderOut makes AppKit think the last
-    // window closed and Ladybird quits.
     auto frame = [window frame];
-    if (frame.origin.x > -5000) {
-        auto w = frame.size.width > 80 ? frame.size.width : 800;
-        auto h = frame.size.height > 80 ? frame.size.height : 600;
-        [window setFrame:NSMakeRect(-20000, -20000, w, h) display:NO];
-    }
+    auto w = frame.size.width > 80 ? frame.size.width : 800;
+    auto h = frame.size.height > 80 ? frame.size.height : 600;
+    park_under_host(window, w, h);
 }
 
 void hide_all_guest_windows()
@@ -115,6 +147,20 @@ void send_surface()
     g_rt.session->send_surface(g_rt.fb);
 }
 
+bool is_internal_url(std::string const& url)
+{
+    if (url.size() >= 6) {
+        auto a = url[0] | 0x20;
+        auto b = url[1] | 0x20;
+        auto c = url[2] | 0x20;
+        auto d = url[3] | 0x20;
+        auto e = url[4] | 0x20;
+        if (a == 'a' && b == 'b' && c == 'o' && d == 'u' && e == 't' && url[5] == ':')
+            return true;
+    }
+    return false;
+}
+
 Tab* active_tab()
 {
     ApplicationDelegate* delegate = [NSApp delegate];
@@ -123,6 +169,9 @@ Tab* active_tab()
     if (auto* tab = [delegate activeTab])
         return tab;
     if ([delegate tabCount] > 0)
+        return nil;
+    // Wait for a real URL so we never spawn Ladybird's about:newtab.
+    if (g_rt.url.empty() || is_internal_url(g_rt.url))
         return nil;
     if (g_rt.no_tab_logs < 8) {
         slog("no tab — creating");
@@ -181,15 +230,15 @@ void tune_guest_window(Tab* tab)
     auto css_w = std::max(1, static_cast<int>(std::lround(g_rt.fb.width / dpr)));
     auto css_h = std::max(1, static_cast<int>(std::lround(g_rt.fb.height / dpr)));
 
-    // Off-screen so it is not a ghost URL at (0,0). Visibility is forced
-    // so WebContent keeps painting into the well.
-    [window setFrame:NSMakeRect(-20000, -20000, css_w, css_h) display:NO];
     [window setContentSize:NSMakeSize(css_w, css_h)];
     hide_guest_window(window);
+    park_under_host(window, css_w, css_h);
     [web_view handleVisibility:YES];
 
-    if (auto* bridge = bridge_for(tab))
+    if (auto* bridge = bridge_for(tab)) {
+        bridge->set_system_visibility_state(Web::HTML::VisibilityState::Visible);
         bridge->set_viewport_rect(Gfx::IntRect { 0, 0, css_w, css_h });
+    }
 
     g_rt.window_tuned = true;
     slog("tune window css=%dx%d fb=%ux%u dpr=%.2f", css_w, css_h, g_rt.fb.width, g_rt.fb.height, dpr);
@@ -201,6 +250,12 @@ bool blit_viewport()
     auto* bridge = bridge_for(tab);
     if (!bridge || g_rt.fb.path.empty() || g_rt.fb.width == 0 || g_rt.fb.height == 0)
         return false;
+    // Keep the well empty until our URL is in flight — no new-tab flash.
+    if (g_rt.url.empty() || is_internal_url(g_rt.url) || !g_rt.load_issued)
+        return false;
+    // TabController sets Hidden when the off-screen window is occluded.
+    // Force Visible so WebContent keeps compositing into the well.
+    [tab.web_view handleVisibility:YES];
 
     auto now = std::chrono::steady_clock::now();
     bool scrolling = now < g_rt.scrolling_until;
@@ -289,8 +344,11 @@ void install_hooks(Tab* tab)
         if (!g_rt.session)
             return;
         auto text = title.to_byte_string();
-        slog("title %s", text.characters());
-        g_rt.session->send_title(std::string { text.characters(), text.length() });
+        std::string s { text.characters(), text.length() };
+        if (is_internal_url(s))
+            return;
+        slog("title %s", s.c_str());
+        g_rt.session->send_title(s);
     };
 
     auto prev_url = move(view.on_url_change);
@@ -300,8 +358,11 @@ void install_hooks(Tab* tab)
         if (!g_rt.session)
             return;
         auto text = url.to_byte_string();
-        slog("url %s", text.characters());
-        g_rt.session->send_url(std::string { text.characters(), text.length() });
+        std::string s { text.characters(), text.length() };
+        if (is_internal_url(s))
+            return;
+        slog("url %s", s.c_str());
+        g_rt.session->send_url(s);
     };
 
     auto prev_start = move(view.on_load_start);
@@ -322,6 +383,7 @@ void install_hooks(Tab* tab)
         if (g_rt.session)
             g_rt.session->send_busy(false);
         g_rt.last_blit = {};
+        g_rt.force_blit = true;
         blit_viewport();
     };
 
@@ -384,10 +446,10 @@ void navigate(std::string url)
     slog("navigate %s", g_rt.url.c_str());
     if (g_rt.session) {
         g_rt.session->send_busy(true);
-        g_rt.session->send_title(g_rt.url.empty() ? "Ladybird" : g_rt.url);
-        g_rt.session->send_url(g_rt.url);
+        if (!is_internal_url(g_rt.url))
+            g_rt.session->send_url(g_rt.url);
     }
-    if (!g_rt.fb.path.empty()) {
+    if (!g_rt.window_tuned && !g_rt.fb.path.empty()) {
         Suzuri::paint_placeholder(g_rt.fb, g_rt.url);
         send_surface();
     }
@@ -560,10 +622,13 @@ void start_timer()
         200 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(timer, ^{
         ensure_view();
-        if (!g_rt.load_issued) {
-            g_rt.last_blit = {};
-            blit_viewport();
+        if (auto* tab = active_tab()) {
+            [tab.web_view handleVisibility:YES];
+            if (auto* win = [tab.web_view window])
+                hide_guest_window(win);
         }
+        if (g_rt.load_issued)
+            blit_viewport();
     });
     dispatch_resume(timer);
 }
@@ -603,7 +668,7 @@ static void suzuri_guest_thread(std::uint16_t port)
         slog("connect failed port=%u", static_cast<unsigned>(port));
         return;
     }
-    session.send_hello("Ladybird");
+    session.send_hello("guest");
     slog("hello port=%u", static_cast<unsigned>(port));
 
     auto* session_ptr = &session;

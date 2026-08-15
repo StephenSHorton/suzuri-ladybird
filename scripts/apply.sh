@@ -93,6 +93,38 @@ print("patched", p)
 PY
 fi
 
+tabc="$dest/UI/AppKit/Interface/TabController.mm"
+if ! grep -q "SUZURI_GUEST_PORT" "$tabc"; then
+  python3 - "$tabc" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+needle = """- (void)windowDidChangeOcclusionState:(NSNotification*)notification
+{
+    [[[self tab] web_view] handleVisibility:([self.window occlusionState] & NSWindowOcclusionStateVisible) != 0];
+}
+"""
+insert = """- (void)windowDidChangeOcclusionState:(NSNotification*)notification
+{
+    // Guest well is an off-screen helper. Occlusion would mark the page Hidden
+    // and WebContent stops painting — the Suzuri pane stays blank.
+    if (getenv("SUZURI_GUEST_PORT") != nullptr) {
+        [[[self tab] web_view] handleVisibility:YES];
+        return;
+    }
+    [[[self tab] web_view] handleVisibility:([self.window occlusionState] & NSWindowOcclusionStateVisible) != 0];
+}
+"""
+if needle not in t:
+    raise SystemExit("TabController.mm: occlusion handler not found — rebase overlay")
+if "<cstdlib>" not in t:
+    t = t.replace("#import <Interface/TabController.h>\n", "#import <Interface/TabController.h>\n#include <cstdlib>\n", 1)
+p.write_text(t.replace(needle, insert, 1))
+print("patched", p)
+PY
+fi
+
 main="$dest/UI/AppKit/main.mm"
 if grep -q "suzuri_guest_try_start" "$main" && ! grep -q "suzuri_guest_prepare_app" "$main"; then
   python3 - "$main" <<'PY'
