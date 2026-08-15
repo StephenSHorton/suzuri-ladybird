@@ -50,6 +50,7 @@ struct GuestRuntime {
     int no_tab_logs { 0 };
     bool force_blit { false };
     std::uint32_t blit_hash { 0 };
+    std::chrono::steady_clock::time_point scrolling_until {};
 };
 
 GuestRuntime g_rt;
@@ -165,9 +166,10 @@ bool blit_viewport()
         return false;
 
     auto now = std::chrono::steady_clock::now();
-    auto min_gap = g_rt.force_blit ? std::chrono::milliseconds(8)
-                                   : std::chrono::milliseconds(33);
-    if (g_rt.last_blit.time_since_epoch().count() != 0 && now - g_rt.last_blit < min_gap)
+    bool scrolling = now < g_rt.scrolling_until;
+    auto min_gap = scrolling ? std::chrono::milliseconds(16) : std::chrono::milliseconds(33);
+    if (!g_rt.force_blit && g_rt.last_blit.time_since_epoch().count() != 0
+        && now - g_rt.last_blit < min_gap)
         return false;
 
     auto paintable = bridge->paintable();
@@ -175,6 +177,10 @@ bool blit_viewport()
         return false;
     auto bitmap = paintable->shared_image_buffer->bitmap_if_present();
     if (!bitmap)
+        return false;
+
+    auto* dest = Suzuri::map_pixels(g_rt.fb);
+    if (!dest)
         return false;
 
     auto* surf = static_cast<IOSurfaceRef>(paintable->shared_image_buffer->iosurface_handle().core_foundation_pointer());
@@ -193,31 +199,27 @@ bool blit_viewport()
         return false;
     }
 
-    std::vector<std::uint8_t> px(static_cast<std::size_t>(dst_w) * dst_h * 4, 0);
     auto const row_bytes = static_cast<std::size_t>(copy_w) * 4;
     std::uint32_t hash = 2166136261u;
     for (int y = 0; y < copy_h; ++y) {
         auto const* src = bitmap->scanline_u8(y);
         if (!src)
             continue;
-        std::memcpy(px.data() + static_cast<std::size_t>(y) * dst_w * 4, src, row_bytes);
-        if ((y & 7) == 0) {
+        std::memcpy(dest + static_cast<std::size_t>(y) * dst_w * 4, src, row_bytes);
+        if ((y & 15) == 0) {
             auto const* px32 = reinterpret_cast<std::uint32_t const*>(src);
-            hash ^= px32[0];
-            hash *= 16777619u;
-            hash ^= px32[static_cast<unsigned>(copy_w - 1)];
-            hash *= 16777619u;
+            hash ^= px32[0] ^ px32[static_cast<unsigned>(copy_w / 2)]
+                ^ px32[static_cast<unsigned>(copy_w - 1)];
         }
     }
 
     if (surf)
         IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, nullptr);
 
-    if (!g_rt.force_blit && hash == g_rt.blit_hash)
+    if (!scrolling && !g_rt.force_blit && hash == g_rt.blit_hash)
         return false;
 
-    if (!Suzuri::write_szfb(g_rt.fb, px))
-        return false;
+    Suzuri::publish_szfb(g_rt.fb);
     g_rt.blit_hash = hash;
     g_rt.force_blit = false;
     g_rt.last_blit = now;
@@ -355,7 +357,6 @@ void scroll_by(Suzuri::HostMessage const& msg)
 {
     if (msg.dx == 0 && msg.dy == 0)
         return;
-    ensure_view();
     auto* bridge = bridge_for(active_tab());
     if (!bridge)
         return;
@@ -374,8 +375,7 @@ void scroll_by(Suzuri::HostMessage const& msg)
     event.button = Web::UIEvents::MouseButton::Middle;
     event.wheel_delta_x = msg.dx;
     event.wheel_delta_y = msg.dy;
-    g_rt.force_blit = true;
-    g_rt.last_blit = {};
+    g_rt.scrolling_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(180);
     bridge->enqueue_input_event(move(event));
 }
 
@@ -386,7 +386,8 @@ Web::UIEvents::MouseButton mouse_button_from_code(int code)
 
 void pointer_at(Suzuri::HostMessage const& msg)
 {
-    ensure_view();
+    if (!g_rt.hooked)
+        ensure_view();
     auto* bridge = bridge_for(active_tab());
     if (!bridge)
         return;
@@ -412,9 +413,8 @@ void pointer_at(Suzuri::HostMessage const& msg)
     event.modifiers = static_cast<Web::UIEvents::KeyModifier>(msg.modifiers);
     if (type == Web::MouseEvent::Type::MouseDown || type == Web::MouseEvent::Type::MouseUp)
         event.click_count = 1;
-    slog("pointer %s %.1f,%.1f btn=%d", msg.kind.c_str(), msg.rect.x, msg.rect.y, msg.button);
-    g_rt.force_blit = true;
-    g_rt.last_blit = {};
+    if (type != Web::MouseEvent::Type::MouseMove)
+        g_rt.scrolling_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(180);
     bridge->enqueue_input_event(move(event));
 }
 
@@ -473,8 +473,7 @@ void send_key(Suzuri::HostMessage const& msg)
         event.code_point = static_cast<u32>(static_cast<unsigned char>(msg.text[0]));
         event.should_insert_text = event.type == Web::KeyEvent::Type::KeyDown;
     }
-    g_rt.force_blit = true;
-    g_rt.last_blit = {};
+    g_rt.scrolling_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(180);
     bridge->enqueue_input_event(move(event));
 }
 
@@ -576,9 +575,19 @@ static void suzuri_guest_thread(std::uint16_t port)
     while (session.poll(msg)) {
         if (msg.type == Suzuri::HostMessage::Type::Kill)
             break;
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            handle_host(msg);
-        });
+        bool const live = msg.type == Suzuri::HostMessage::Type::Scroll
+            || msg.type == Suzuri::HostMessage::Type::Pointer
+            || msg.type == Suzuri::HostMessage::Type::Key;
+        if (live) {
+            auto copy = msg;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                handle_host(copy);
+            });
+        } else {
+            dispatch_sync(dispatch_get_main_queue(), ^{
+                handle_host(msg);
+            });
+        }
     }
 
     dispatch_sync(dispatch_get_main_queue(), ^{

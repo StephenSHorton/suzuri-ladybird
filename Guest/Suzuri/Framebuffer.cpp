@@ -2,28 +2,69 @@
 
 #include <algorithm>
 #include <cstring>
-#include <fstream>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <vector>
 
 namespace Suzuri {
 
 static constexpr char const magic[4] = { 'S', 'Z', 'F', 'B' };
 
-bool write_szfb(Framebuffer& fb, std::vector<std::uint8_t> const& bgra)
+struct Mapping {
+    std::string path;
+    int fd { -1 };
+    std::uint8_t* p { nullptr };
+    std::size_t len { 0 };
+};
+
+static Mapping g_map;
+
+static void unmap()
+{
+    if (g_map.p && g_map.p != MAP_FAILED)
+        munmap(g_map.p, g_map.len);
+    if (g_map.fd >= 0)
+        close(g_map.fd);
+    g_map = {};
+}
+
+static std::size_t payload_bytes(Framebuffer const& fb)
+{
+    return static_cast<std::size_t>(fb.width) * fb.height * 4;
+}
+
+std::uint8_t* map_pixels(Framebuffer& fb)
 {
     if (fb.width == 0 || fb.height == 0 || fb.path.empty())
-        return false;
-    auto const n = static_cast<std::size_t>(fb.width) * fb.height * 4;
-    if (bgra.size() < n)
-        return false;
-    fb.seq += 1;
-    std::fstream out(fb.path, std::ios::in | std::ios::out | std::ios::binary);
-    if (!out) {
-        out.open(fb.path, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!out)
-            return false;
+        return nullptr;
+    auto const n = payload_bytes(fb);
+    auto const total = 16 + n;
+    if (g_map.p && g_map.path == fb.path && g_map.len == total)
+        return g_map.p + 16;
+
+    unmap();
+    int fd = open(fb.path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0)
+        return nullptr;
+    if (ftruncate(fd, static_cast<off_t>(total)) != 0) {
+        close(fd);
+        return nullptr;
     }
-    out.seekp(16);
-    out.write(reinterpret_cast<char const*>(bgra.data()), static_cast<std::streamsize>(n));
+    auto* p = static_cast<std::uint8_t*>(mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+    if (p == MAP_FAILED) {
+        close(fd);
+        return nullptr;
+    }
+    g_map = { fb.path, fd, p, total };
+    return p + 16;
+}
+
+void publish_szfb(Framebuffer& fb)
+{
+    if (!g_map.p || g_map.path != fb.path)
+        return;
+    fb.seq += 1;
     char hdr[16] {};
     std::memcpy(hdr, magic, 4);
     auto put_u32 = [](char* p, std::uint32_t v) {
@@ -35,10 +76,20 @@ bool write_szfb(Framebuffer& fb, std::vector<std::uint8_t> const& bgra)
     put_u32(hdr + 4, fb.width);
     put_u32(hdr + 8, fb.height);
     put_u32(hdr + 12, fb.seq);
-    out.seekp(0);
-    out.write(hdr, 16);
-    out.flush();
-    return static_cast<bool>(out);
+    std::memcpy(g_map.p, hdr, 16);
+}
+
+bool write_szfb(Framebuffer& fb, std::vector<std::uint8_t> const& bgra)
+{
+    auto const n = payload_bytes(fb);
+    if (n == 0 || bgra.size() < n)
+        return false;
+    auto* dest = map_pixels(fb);
+    if (!dest)
+        return false;
+    std::memcpy(dest, bgra.data(), n);
+    publish_szfb(fb);
+    return true;
 }
 
 void paint_placeholder(Framebuffer& fb, std::string const& url)
