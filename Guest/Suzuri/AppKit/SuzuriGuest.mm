@@ -143,12 +143,12 @@ void tune_guest_window(Tab* tab)
     auto css_w = std::max(1, static_cast<int>(std::lround(g_rt.fb.width / dpr)));
     auto css_h = std::max(1, static_cast<int>(std::lround(g_rt.fb.height / dpr)));
 
-    // Keep a 1×1 on-screen sliver so AppKit does not treat the window as
-    // occluded (that pauses WebContent paints). The well gets SZFB pixels.
-    [window setFrame:NSMakeRect(0, 0, css_w, css_h) display:YES];
+    // Off-screen so it is not a ghost URL at (0,0). Visibility is forced
+    // so WebContent keeps painting into the well.
+    [window setFrame:NSMakeRect(-20000, -20000, css_w, css_h) display:NO];
     [window setContentSize:NSMakeSize(css_w, css_h)];
-    [window setAlphaValue:0.02];
-    [window orderBack:nil];
+    [window setAlphaValue:0];
+    [window setIgnoresMouseEvents:YES];
     [web_view handleVisibility:YES];
 
     if (auto* bridge = bridge_for(tab))
