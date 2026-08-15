@@ -94,6 +94,20 @@ PY
 fi
 
 main="$dest/UI/AppKit/main.mm"
+if grep -q "suzuri_guest_try_start" "$main" && ! grep -q "suzuri_guest_prepare_app" "$main"; then
+  python3 - "$main" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+needle = "    auto app = TRY(Ladybird::Application::create(arguments));\n"
+insert = needle + "    suzuri_guest_prepare_app();\n"
+if needle not in t:
+    raise SystemExit("main.mm: Application::create not found — rebase overlay")
+p.write_text(t.replace(needle, insert, 1))
+print("patched prepare_app", p)
+PY
+fi
 if ! grep -q "suzuri_guest_try_start" "$main"; then
   python3 - "$main" <<'PY'
 from pathlib import Path
@@ -109,6 +123,7 @@ needle = "    auto app = TRY(Ladybird::Application::create(arguments));\n"
 insert = (
     "    suzuri_guest_try_start(arguments.argc, arguments.argv);\n"
     + needle
+    + "    suzuri_guest_prepare_app();\n"
 )
 if needle not in t:
     raise SystemExit("main.mm: Application::create not found — rebase overlay")

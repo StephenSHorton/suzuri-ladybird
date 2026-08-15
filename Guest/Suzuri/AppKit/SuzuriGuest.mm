@@ -54,6 +54,44 @@ struct GuestRuntime {
 };
 
 GuestRuntime g_rt;
+bool g_is_guest { false };
+
+Tab* active_tab();
+
+void hide_guest_window(NSWindow* window)
+{
+    if (window == nil)
+        return;
+    [window setRestorable:NO];
+    [window setFrameAutosaveName:@""];
+    [window setExcludedFromWindowsMenu:YES];
+    [window setHasShadow:NO];
+    [window setIgnoresMouseEvents:YES];
+    [window setAlphaValue:0];
+    [window setCollectionBehavior:NSWindowCollectionBehaviorTransient
+            | NSWindowCollectionBehaviorIgnoresCycle
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorCanJoinAllSpaces];
+    // Keep a window (off-screen). orderOut makes AppKit think the last
+    // window closed and Ladybird quits.
+    auto frame = [window frame];
+    if (frame.origin.x > -5000) {
+        auto w = frame.size.width > 80 ? frame.size.width : 800;
+        auto h = frame.size.height > 80 ? frame.size.height : 600;
+        [window setFrame:NSMakeRect(-20000, -20000, w, h) display:NO];
+    }
+}
+
+void hide_all_guest_windows()
+{
+    if (NSApp == nil)
+        return;
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    for (NSWindow* window in [NSApp windows])
+        hide_guest_window(window);
+    if (auto* tab = active_tab())
+        [tab.web_view handleVisibility:YES];
+}
 
 __attribute__((format(printf, 1, 2)))
 void slog(char const* fmt, ...)
@@ -147,8 +185,7 @@ void tune_guest_window(Tab* tab)
     // so WebContent keeps painting into the well.
     [window setFrame:NSMakeRect(-20000, -20000, css_w, css_h) display:NO];
     [window setContentSize:NSMakeSize(css_w, css_h)];
-    [window setAlphaValue:0];
-    [window setIgnoresMouseEvents:YES];
+    hide_guest_window(window);
     [web_view handleVisibility:YES];
 
     if (auto* bridge = bridge_for(tab))
@@ -533,24 +570,23 @@ void start_timer()
 
 void prepare_appkit()
 {
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    hide_all_guest_windows();
     if (!g_rt.observers) {
         g_rt.observers = true;
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:NSApplicationDidFinishLaunchingNotification
+        NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
+        [nc addObserverForName:NSApplicationDidFinishLaunchingNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification*) {
                         slog("did_finish_launching");
+                        hide_all_guest_windows();
                         ensure_view();
                     }];
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:NSWindowDidChangeOcclusionStateNotification
+        [nc addObserverForName:NSWindowDidChangeOcclusionStateNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification*) {
-                        if (auto* tab = active_tab())
-                            [tab.web_view handleVisibility:YES];
+                        hide_all_guest_windows();
                     }];
     }
     start_timer();
@@ -603,11 +639,24 @@ static void suzuri_guest_thread(std::uint16_t port)
     slog("session end");
 }
 
+void suzuri_guest_prepare_app(void)
+{
+    if (!g_is_guest)
+        return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        hide_all_guest_windows();
+    });
+}
+
 int suzuri_guest_try_start(int argc, char const* const* argv)
 {
     auto port = Suzuri::port_from_args(argc, argv);
     if (!port)
         return 0;
+    g_is_guest = true;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        hide_all_guest_windows();
+    });
     std::thread(suzuri_guest_thread, *port).detach();
     return 1;
 }
