@@ -252,6 +252,8 @@ HostMessage parse_host_line(std::string const& line)
         m.rect.w = static_cast<float>(*w);
     if (auto h = json_number(line, "h"))
         m.rect.h = static_cast<float>(*h);
+    if (auto dx = json_number(line, "dx"))
+        m.dx = *dx;
     if (auto dy = json_number(line, "dy"))
         m.dy = *dy;
     m.kind = json_string(line, "kind").value_or("");

@@ -37,6 +37,7 @@ struct HostMessage {
     std::string cwd;
     std::string url;
     bool focus_in { false };
+    double dx { 0 };
     double dy { 0 };
     std::string kind;
     int button { 0 };

@@ -165,8 +165,9 @@ bool blit_viewport()
         return false;
 
     auto now = std::chrono::steady_clock::now();
-    if (!g_rt.force_blit && g_rt.last_blit.time_since_epoch().count() != 0
-        && now - g_rt.last_blit < std::chrono::milliseconds(33))
+    auto min_gap = g_rt.force_blit ? std::chrono::milliseconds(8)
+                                   : std::chrono::milliseconds(33);
+    if (g_rt.last_blit.time_since_epoch().count() != 0 && now - g_rt.last_blit < min_gap)
         return false;
 
     auto paintable = bridge->paintable();
@@ -350,25 +351,29 @@ void navigate(std::string url)
         g_rt.session->send_busy(false);
 }
 
-void scroll_by(double dy)
+void scroll_by(Suzuri::HostMessage const& msg)
 {
-    if (dy == 0)
+    if (msg.dx == 0 && msg.dy == 0)
         return;
-    slog("scroll dy=%g", dy);
     ensure_view();
     auto* bridge = bridge_for(active_tab());
     if (!bridge)
         return;
 
+    double dpr = g_rt.scale > 0.5 ? static_cast<double>(g_rt.scale) : 1.0;
+    int x = static_cast<int>(msg.rect.x);
+    int y = static_cast<int>(msg.rect.y);
+    if (x == 0 && y == 0) {
+        x = std::max(1, static_cast<int>(g_rt.fb.width / dpr / 2));
+        y = std::max(1, static_cast<int>(g_rt.fb.height / dpr / 2));
+    }
     Web::MouseEvent event;
     event.type = Web::MouseEvent::Type::MouseWheel;
-    double dpr = g_rt.scale > 0.5 ? static_cast<double>(g_rt.scale) : 1.0;
-    auto x = std::max(1, static_cast<int>(g_rt.fb.width / dpr / 2));
-    auto y = std::max(1, static_cast<int>(g_rt.fb.height / dpr / 2));
     event.position = { x, y };
     event.screen_position = { x, y };
     event.button = Web::UIEvents::MouseButton::Middle;
-    event.wheel_delta_y = dy;
+    event.wheel_delta_x = msg.dx;
+    event.wheel_delta_y = msg.dy;
     g_rt.force_blit = true;
     g_rt.last_blit = {};
     bridge->enqueue_input_event(move(event));
@@ -484,7 +489,7 @@ void handle_host(Suzuri::HostMessage const& msg)
         navigate(msg.url);
         break;
     case Suzuri::HostMessage::Type::Scroll:
-        scroll_by(msg.dy);
+        scroll_by(msg);
         break;
     case Suzuri::HostMessage::Type::Pointer:
         pointer_at(msg);
