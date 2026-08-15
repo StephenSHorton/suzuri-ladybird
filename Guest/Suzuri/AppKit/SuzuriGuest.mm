@@ -320,13 +320,19 @@ void apply_fb(Suzuri::HostMessage const& msg)
 {
     if (!msg.fb)
         return;
+    bool const same = g_rt.fb.path == msg.fb->path && g_rt.fb.width == msg.fb->width
+        && g_rt.fb.height == msg.fb->height;
     g_rt.fb = *msg.fb;
     if (msg.scale > 0)
         g_rt.scale = msg.scale;
     slog("fb %s %ux%u scale=%.2f", g_rt.fb.path.c_str(), g_rt.fb.width, g_rt.fb.height, g_rt.scale);
-    // Resize must not re-strip chrome (borderless windows abort on accessories).
-    if (g_rt.window_tuned)
-        g_rt.window_tuned = false;
+    if (same) {
+        if (auto* tab = active_tab())
+            [tab.web_view handleVisibility:YES];
+        blit_viewport();
+        return;
+    }
+    g_rt.window_tuned = false;
     ensure_view();
     if (!blit_viewport() && !g_rt.fb.path.empty()) {
         Suzuri::paint_placeholder(g_rt.fb, g_rt.url);

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -40,8 +41,11 @@ std::uint8_t* map_pixels(Framebuffer& fb)
         return nullptr;
     auto const n = payload_bytes(fb);
     auto const total = 16 + n;
-    if (g_map.p && g_map.path == fb.path && g_map.len == total)
-        return g_map.p + 16;
+    if (g_map.p && g_map.path == fb.path && g_map.len == total) {
+        struct stat st {};
+        if (fstat(g_map.fd, &st) == 0 && static_cast<std::size_t>(st.st_size) >= total)
+            return g_map.p + 16;
+    }
 
     unmap();
     int fd = open(fb.path.c_str(), O_RDWR | O_CREAT, 0644);
