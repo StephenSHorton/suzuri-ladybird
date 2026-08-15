@@ -74,8 +74,11 @@ fn serve(stream: TcpStream) -> io::Result<()> {
                 write_line(&mut writer, &field_msg("title", title_for(&url)))?;
                 write_line(&mut writer, &field_msg("url", &url))?;
                 if let Some(slot) = &fb {
-                    paint_current(slot, &url);
+                    let _ = paint_placeholder(slot, &url);
                     write_line(&mut writer, &surface_msg(slot))?;
+                    if paint_ladybird(slot, &url).is_ok() {
+                        write_line(&mut writer, &surface_msg(slot))?;
+                    }
                 }
                 write_line(&mut writer, r#"{"type":"busy","bool":false}"#)?;
             }
@@ -95,14 +98,18 @@ fn title_for(url: &str) -> &str {
 }
 
 fn paint_current(fb: &FbSlot, url: &str) {
-    if !url.is_empty() {
-        if let Some(bin) = find_ladybird() {
-            if headless_into_fb(&bin, fb, url).is_ok() {
-                return;
-            }
-        }
+    if paint_ladybird(fb, url).is_ok() {
+        return;
     }
     let _ = paint_placeholder(fb, url);
+}
+
+fn paint_ladybird(fb: &FbSlot, url: &str) -> io::Result<()> {
+    if url.is_empty() {
+        return Err(io::Error::other("no url"));
+    }
+    let bin = find_ladybird().ok_or_else(|| io::Error::other("no ladybird binary"))?;
+    headless_into_fb(&bin, fb, url)
 }
 
 fn find_ladybird() -> Option<PathBuf> {
@@ -115,6 +122,7 @@ fn find_ladybird() -> Option<PathBuf> {
     let home = env::var("HOME").ok()?;
     let candidates = [
         format!("{home}/projects/ladybird/Build/release/bin/Ladybird.app/Contents/MacOS/Ladybird"),
+        format!("{home}/projects/ladybird/Build/release/bin/Ladybird"),
         format!("{home}/ladybird/Build/release/bin/Ladybird.app/Contents/MacOS/Ladybird"),
         "/Applications/Ladybird.app/Contents/MacOS/Ladybird".into(),
     ];
@@ -148,10 +156,96 @@ fn headless_into_fb(bin: &Path, fb: &FbSlot, url: &str) -> io::Result<()> {
         let _ = std::fs::remove_file(&png);
         return Err(io::Error::other("ladybird headless screenshot failed"));
     }
-    // PNG decode is a later slice. For now a successful run still paints
-    // the placeholder so the well updates; chrome shows the URL.
+    let result = png_file_to_szfb(&png, fb);
     let _ = std::fs::remove_file(&png);
-    paint_placeholder(fb, url)
+    result
+}
+
+fn png_file_to_szfb(png: &Path, fb: &FbSlot) -> io::Result<()> {
+    let bgra = decode_png_bgra(png, fb.w, fb.h)?;
+    let seq = read_seq(&fb.path).unwrap_or(0).wrapping_add(1);
+    write_szfb(&fb.path, fb.w, fb.h, seq, &bgra)
+}
+
+/// Decode a PNG and nearest-neighbor scale into `dst_w`×`dst_h` BGRA.
+fn decode_png_bgra(path: &Path, dst_w: u32, dst_h: u32) -> io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let decoder = png::Decoder::new(file);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut raw = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut raw)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let src_w = info.width.max(1);
+    let src_h = info.height.max(1);
+    let src = match info.color_type {
+        png::ColorType::Rgba => rgba_to_bgra(&raw[..info.buffer_size()]),
+        png::ColorType::Rgb => rgb_to_bgra(&raw[..info.buffer_size()]),
+        png::ColorType::Grayscale => gray_to_bgra(&raw[..info.buffer_size()]),
+        png::ColorType::GrayscaleAlpha => gray_alpha_to_bgra(&raw[..info.buffer_size()]),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported png color {other:?}"),
+            ));
+        }
+    };
+    Ok(scale_bgra(&src, src_w, src_h, dst_w.max(1), dst_h.max(1)))
+}
+
+fn rgba_to_bgra(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
+    for px in src.chunks_exact(4) {
+        out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    out
+}
+
+fn rgb_to_bgra(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() / 3 * 4);
+    for px in src.chunks_exact(3) {
+        out.extend_from_slice(&[px[2], px[1], px[0], 255]);
+    }
+    out
+}
+
+fn gray_to_bgra(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() * 4);
+    for &g in src {
+        out.extend_from_slice(&[g, g, g, 255]);
+    }
+    out
+}
+
+fn gray_alpha_to_bgra(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len() / 2 * 4);
+    for px in src.chunks_exact(2) {
+        out.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+    }
+    out
+}
+
+fn scale_bgra(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    let mut out = vec![0u8; dst_w as usize * dst_h as usize * 4];
+    if src_w == dst_w && src_h == dst_h {
+        let n = out.len().min(src.len());
+        out[..n].copy_from_slice(&src[..n]);
+        return out;
+    }
+    for y in 0..dst_h as usize {
+        let sy = y * src_h as usize / dst_h as usize;
+        for x in 0..dst_w as usize {
+            let sx = x * src_w as usize / dst_w as usize;
+            let si = (sy * src_w as usize + sx) * 4;
+            let di = (y * dst_w as usize + x) * 4;
+            if si + 4 <= src.len() {
+                out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+    }
+    out
 }
 
 fn paint_placeholder(fb: &FbSlot, url: &str) -> io::Result<()> {
@@ -445,5 +539,41 @@ mod tests {
     #[test]
     fn busy_msg_is_bool() {
         assert_eq!(field_msg("busy", "true"), r#"{"type":"busy","bool":true}"#);
+    }
+
+    #[test]
+    fn png_rgba_scales_into_szfb() {
+        let dir = std::env::temp_dir();
+        let png = dir.join(format!("suzuri-lb-src-{}.png", std::process::id()));
+        let fb_path = dir.join(format!("suzuri-lb-dst-{}.szfb", std::process::id()));
+        {
+            let f = std::fs::File::create(&png).unwrap();
+            let mut enc = png::Encoder::new(f, 2, 2);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            // R, G / B, white
+            w.write_image_data(&[
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ])
+            .unwrap();
+        }
+        let slot = FbSlot {
+            path: fb_path.to_string_lossy().into(),
+            w: 4,
+            h: 4,
+        };
+        png_file_to_szfb(&png, &slot).unwrap();
+        let mut hdr = [0u8; 16];
+        let mut f = std::fs::File::open(&fb_path).unwrap();
+        use std::io::Read;
+        f.read_exact(&mut hdr).unwrap();
+        assert_eq!(&hdr[0..4], b"SZFB");
+        let mut px = vec![0u8; 4 * 4 * 4];
+        f.read_exact(&mut px).unwrap();
+        // top-left of a 2x2 red pixel, scaled 2x, is BGRA red
+        assert_eq!(&px[0..4], &[0, 0, 255, 255]);
+        let _ = std::fs::remove_file(&png);
+        let _ = std::fs::remove_file(&fb_path);
     }
 }

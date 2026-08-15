@@ -9,3 +9,6 @@ publish = false
 [[bin]]
 name = "suzuri-ladybird"
 path = "src/main.rs"
+
+[dependencies]
+png = "0.17"

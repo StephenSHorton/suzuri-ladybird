@@ -6,7 +6,7 @@ This repo is the **tracker + overlay**. It does **not** vendor LibWeb.
 `StephenSHorton/suzuri` never contains the engine. Install is optional:
 a manifest points at a binary you built.
 
-Pinned upstream: see [`UPSTREAM`](UPSTREAM) (`LadybirdBrowser/ladybird` @ `7d6a1967ea44`).
+Pinned upstream: see [`UPSTREAM`](UPSTREAM) (`LadybirdBrowser/ladybird` @ `accee62a12e4`).
 
 ## What chrome talks to
 
