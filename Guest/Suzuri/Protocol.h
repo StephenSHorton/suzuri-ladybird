@@ -22,6 +22,7 @@ struct HostMessage {
         Resize,
         Focus,
         Navigate,
+        Scroll,
         Draft,
         Stack,
         Kill,
@@ -34,6 +35,7 @@ struct HostMessage {
     std::string cwd;
     std::string url;
     bool focus_in { false };
+    double dy { 0 };
     std::optional<Framebuffer> fb;
 };
 

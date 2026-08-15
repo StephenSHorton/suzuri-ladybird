@@ -1,7 +1,8 @@
 {
   "id": "ladybird",
   "name": "Ladybird",
-  "command": "/ABS/PATH/TO/suzuri-ladybird",
+  "command": "/ABS/PATH/TO/Ladybird.app/Contents/MacOS/Ladybird",
+  "args": ["--temporary-profile"],
   "protocol": 1,
   "capabilities": ["pane", "navigate"]
 }

@@ -15,17 +15,14 @@ speaks line-delimited JSON on `127.0.0.1` and paints a `SZFB` file that
 chrome blits into the mosaic well.
 
 Until Ladybird is built and the overlay is applied, the **Rust guest**
-in `sidecar/` is that process. It is titled `Ladybird`, owns the well
-pixels, and on `navigate` will shell out to a Ladybird binary if
-`LADYBIRD` (or a default path) exists:
+in `sidecar/` is that process. It is titled `Ladybird` and still has a
+headless screenshot fallback (slow: one process per navigate).
 
-```
-Ladybird --headless screenshot --screenshot-path <png> \
-  --window-width W --window-height H --force-new-process URL
-```
-
-Ladybird already ships that headless path. The overlay
-(`Guest/Suzuri/`) is the in-process hook: same ABI, no extra process.
+The overlay (`Guest/Suzuri/`) is the live path: one Ladybird, `navigate`
+calls `loadURL`, `scroll` wheels the WebView, and each compositor frame
+copies the **viewport** into SZFB. Point the manifest `command` at the
+Ladybird binary after `scripts/apply.sh`. Pass `--temporary-profile` so
+the guest does not join a desktop Ladybird.
 
 MCP (eval / screenshot / click) stays later, inside this process.
 
