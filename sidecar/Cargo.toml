@@ -1,0 +1,11 @@
+[package]
+name = "suzuri-ladybird"
+version = "0.1.0"
+edition = "2021"
+description = "Suzuri guest process for Ladybird (sidecar until the overlay is applied)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "suzuri-ladybird"
+path = "src/main.rs"

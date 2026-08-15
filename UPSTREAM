@@ -1,0 +1,6 @@
+# Ladybird commit this overlay is written against.
+# Pull with: scripts/sync-upstream.sh
+repo=https://github.com/LadybirdBrowser/ladybird.git
+sha=7d6a1967ea44
+date=2026-08-15
+note=Tests: Collect from a task in the AudioNode lifetime test

@@ -1,0 +1,7 @@
+{
+  "id": "ladybird",
+  "name": "Ladybird",
+  "command": "/ABS/PATH/TO/suzuri-ladybird",
+  "protocol": 1,
+  "capabilities": ["pane", "navigate"]
+}
