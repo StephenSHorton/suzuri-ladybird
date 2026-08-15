@@ -79,13 +79,22 @@ std::optional<double> json_number(std::string const& line, char const* key)
     ++pos;
     while (pos < line.size() && (line[pos] == ' '))
         ++pos;
-    try {
-        std::size_t used = 0;
-        auto v = std::stod(line.substr(pos), &used);
-        return v;
-    } catch (...) {
+    char* end = nullptr;
+    auto v = std::strtod(line.c_str() + pos, &end);
+    if (end == line.c_str() + pos)
         return std::nullopt;
-    }
+    return v;
+}
+
+std::optional<int> parse_int(char const* s)
+{
+    if (!s || !*s)
+        return std::nullopt;
+    char* end = nullptr;
+    auto v = std::strtol(s, &end, 10);
+    if (end == s)
+        return std::nullopt;
+    return static_cast<int>(v);
 }
 
 } // namespace
@@ -188,32 +197,20 @@ std::optional<std::uint16_t> port_from_args(int argc, char const* const* argv)
         if (a == "--suzuri-guest")
             continue;
         if (a == "--port" && i + 1 < argc) {
-            try {
-                auto v = std::stoi(argv[++i]);
-                if (v > 0 && v < 65536)
-                    port = static_cast<std::uint16_t>(v);
-            } catch (...) {
-            }
+            if (auto v = parse_int(argv[++i]); v && *v > 0 && *v < 65536)
+                port = static_cast<std::uint16_t>(*v);
             continue;
         }
         if (a.rfind("--port=", 0) == 0) {
-            try {
-                auto v = std::stoi(a.substr(7));
-                if (v > 0 && v < 65536)
-                    port = static_cast<std::uint16_t>(v);
-            } catch (...) {
-            }
+            if (auto v = parse_int(a.c_str() + 7); v && *v > 0 && *v < 65536)
+                port = static_cast<std::uint16_t>(*v);
         }
     }
     if (port)
         return port;
     if (auto* env = std::getenv("SUZURI_GUEST_PORT")) {
-        try {
-            auto v = std::stoi(env);
-            if (v > 0 && v < 65536)
-                return static_cast<std::uint16_t>(v);
-        } catch (...) {
-        }
+        if (auto v = parse_int(env); v && *v > 0 && *v < 65536)
+            return static_cast<std::uint16_t>(*v);
     }
     return std::nullopt;
 }
