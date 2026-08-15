@@ -48,10 +48,18 @@ fn main() {
     let _ = serve(stream);
 }
 
+struct Page {
+    px: Vec<u8>,
+    w: u32,
+    h: u32,
+    scroll: u32,
+}
+
 fn serve(stream: TcpStream) -> io::Result<()> {
     let mut writer = stream.try_clone()?;
     let mut fb: Option<FbSlot> = None;
     let mut url = String::new();
+    let mut page: Option<Page> = None;
     for line in BufReader::new(stream).lines() {
         let line = line?;
         if line.is_empty() {
@@ -63,22 +71,39 @@ fn serve(stream: TcpStream) -> io::Result<()> {
                     fb = Some(next);
                 }
                 if let Some(slot) = &fb {
-                    paint_current(slot, &url);
+                    if let Some(p) = page.as_mut() {
+                        if p.w == slot.w {
+                            let _ = blit_page(slot, p);
+                            write_line(&mut writer, &surface_msg(slot))?;
+                            continue;
+                        }
+                    }
+                    page = None;
+                    paint_current(slot, &url, &mut page);
                     write_line(&mut writer, &surface_msg(slot))?;
                 }
             }
             Some("stack") | Some("focus") | Some("draft") => {}
+            Some("scroll") => {
+                let dy = json_i64_field(&line, "dy").unwrap_or(0);
+                if let (Some(slot), Some(p)) = (fb.as_ref(), page.as_mut()) {
+                    if apply_scroll(p, slot.h, dy) {
+                        let _ = blit_page(slot, p);
+                        write_line(&mut writer, &surface_msg(slot))?;
+                    }
+                }
+            }
             Some("navigate") => {
                 url = extract_url(&line);
+                page = None;
                 write_line(&mut writer, &field_msg("busy", "true"))?;
                 write_line(&mut writer, &field_msg("title", title_for(&url)))?;
                 write_line(&mut writer, &field_msg("url", &url))?;
                 if let Some(slot) = &fb {
                     let _ = paint_placeholder(slot, &url);
                     write_line(&mut writer, &surface_msg(slot))?;
-                    if paint_ladybird(slot, &url).is_ok() {
-                        write_line(&mut writer, &surface_msg(slot))?;
-                    }
+                    paint_current(slot, &url, &mut page);
+                    write_line(&mut writer, &surface_msg(slot))?;
                 }
                 write_line(&mut writer, r#"{"type":"busy","bool":false}"#)?;
             }
@@ -97,19 +122,32 @@ fn title_for(url: &str) -> &str {
     }
 }
 
-fn paint_current(fb: &FbSlot, url: &str) {
-    if paint_ladybird(fb, url).is_ok() {
+fn paint_current(fb: &FbSlot, url: &str, page: &mut Option<Page>) {
+    if let Ok(p) = capture_page(fb, url) {
+        let _ = blit_page(fb, &p);
+        *page = Some(p);
         return;
     }
+    *page = None;
     let _ = paint_placeholder(fb, url);
 }
 
-fn paint_ladybird(fb: &FbSlot, url: &str) -> io::Result<()> {
+fn capture_page(fb: &FbSlot, url: &str) -> io::Result<Page> {
     if url.is_empty() {
         return Err(io::Error::other("no url"));
     }
     let bin = find_ladybird().ok_or_else(|| io::Error::other("no ladybird binary"))?;
-    headless_into_fb(&bin, fb, url)
+    headless_page(&bin, fb, url)
+}
+
+fn apply_scroll(page: &mut Page, view_h: u32, dy: i64) -> bool {
+    let max = page.h.saturating_sub(view_h.max(1));
+    let next = (page.scroll as i64 + dy).clamp(0, max as i64) as u32;
+    if next == page.scroll {
+        return false;
+    }
+    page.scroll = next;
+    true
 }
 
 fn find_ladybird() -> Option<PathBuf> {
@@ -129,7 +167,7 @@ fn find_ladybird() -> Option<PathBuf> {
     candidates.into_iter().map(PathBuf::from).find(|p| p.is_file())
 }
 
-fn headless_into_fb(bin: &Path, fb: &FbSlot, url: &str) -> io::Result<()> {
+fn headless_page(bin: &Path, fb: &FbSlot, url: &str) -> io::Result<Page> {
     let png = std::env::temp_dir().join(format!(
         "suzuri-ladybird-{}-{}.png",
         process::id(),
@@ -163,19 +201,19 @@ fn headless_into_fb(bin: &Path, fb: &FbSlot, url: &str) -> io::Result<()> {
         let _ = std::fs::remove_file(&png);
         return Err(io::Error::other("ladybird headless screenshot failed"));
     }
-    let result = png_file_to_szfb(&png, fb);
+    let page = decode_png_page(&png, fb.w.max(1))?;
     let _ = std::fs::remove_file(&png);
-    result
+    Ok(page)
 }
 
-fn png_file_to_szfb(png: &Path, fb: &FbSlot) -> io::Result<()> {
-    let bgra = decode_png_bgra(png, fb.w, fb.h)?;
+fn blit_page(fb: &FbSlot, page: &Page) -> io::Result<()> {
+    let bgra = crop_viewport(&page.px, page.w, page.h, fb.w, fb.h, page.scroll);
     let seq = read_seq(&fb.path).unwrap_or(0).wrapping_add(1);
     write_szfb(&fb.path, fb.w, fb.h, seq, &bgra)
 }
 
-/// Decode a PNG and nearest-neighbor scale into `dst_w`×`dst_h` BGRA.
-fn decode_png_bgra(path: &Path, dst_w: u32, dst_h: u32) -> io::Result<Vec<u8>> {
+/// Decode a PNG and scale width to `dst_w` (keep aspect). Height may exceed the well.
+fn decode_png_page(path: &Path, dst_w: u32) -> io::Result<Page> {
     let file = std::fs::File::open(path)?;
     let decoder = png::Decoder::new(file);
     let mut reader = decoder
@@ -199,7 +237,46 @@ fn decode_png_bgra(path: &Path, dst_w: u32, dst_h: u32) -> io::Result<Vec<u8>> {
             ));
         }
     };
-    Ok(scale_bgra(&src, src_w, src_h, dst_w.max(1), dst_h.max(1)))
+    let dst_w = dst_w.max(1);
+    let dst_h = ((src_h as u64 * dst_w as u64) / src_w as u64).max(1) as u32;
+    let px = if src_w == dst_w {
+        src
+    } else {
+        scale_bgra(&src, src_w, src_h, dst_w, dst_h)
+    };
+    Ok(Page {
+        px,
+        w: dst_w,
+        h: dst_h,
+        scroll: 0,
+    })
+}
+
+/// Copy `dst_h` rows starting at `scroll` (source already width-matched).
+fn crop_viewport(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32, scroll: u32) -> Vec<u8> {
+    let dst_w = dst_w.max(1);
+    let dst_h = dst_h.max(1);
+    let mut out = vec![0u8; dst_w as usize * dst_h as usize * 4];
+    if src_w == 0 || src_h == 0 {
+        return out;
+    }
+    let max_y = src_h.saturating_sub(1);
+    for y in 0..dst_h as usize {
+        let sy = (scroll as usize + y).min(max_y as usize);
+        for x in 0..dst_w as usize {
+            let sx = if src_w == dst_w {
+                x
+            } else {
+                x * src_w as usize / dst_w as usize
+            };
+            let si = (sy * src_w as usize + sx.min(src_w as usize - 1)) * 4;
+            let di = (y * dst_w as usize + x) * 4;
+            if si + 4 <= src.len() {
+                out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+    }
+    out
 }
 
 fn rgba_to_bgra(src: &[u8]) -> Vec<u8> {
@@ -549,38 +626,48 @@ mod tests {
     }
 
     #[test]
-    fn png_rgba_scales_into_szfb() {
+    fn png_viewport_is_top_not_squashed() {
         let dir = std::env::temp_dir();
         let png = dir.join(format!("suzuri-lb-src-{}.png", std::process::id()));
         let fb_path = dir.join(format!("suzuri-lb-dst-{}.szfb", std::process::id()));
         {
             let f = std::fs::File::create(&png).unwrap();
-            let mut enc = png::Encoder::new(f, 2, 2);
+            let mut enc = png::Encoder::new(f, 2, 4);
             enc.set_color(png::ColorType::Rgba);
             enc.set_depth(png::BitDepth::Eight);
             let mut w = enc.write_header().unwrap();
-            // R, G / B, white
+            // row0 red, row1 green, row2 blue, row3 white
             w.write_image_data(&[
-                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+                255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255,
+                0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
             ])
             .unwrap();
         }
+        let mut page = decode_png_page(&png, 2).unwrap();
+        assert_eq!(page.h, 4);
         let slot = FbSlot {
             path: fb_path.to_string_lossy().into(),
-            w: 4,
-            h: 4,
+            w: 2,
+            h: 2,
         };
-        png_file_to_szfb(&png, &slot).unwrap();
-        let mut hdr = [0u8; 16];
-        let mut f = std::fs::File::open(&fb_path).unwrap();
-        use std::io::Read;
-        f.read_exact(&mut hdr).unwrap();
-        assert_eq!(&hdr[0..4], b"SZFB");
-        let mut px = vec![0u8; 4 * 4 * 4];
-        f.read_exact(&mut px).unwrap();
-        // top-left of a 2x2 red pixel, scaled 2x, is BGRA red
-        assert_eq!(&px[0..4], &[0, 0, 255, 255]);
+        blit_page(&slot, &page).unwrap();
+        let view = read_fb_pixels(&fb_path, 2, 2);
+        assert_eq!(&view[0..4], &[0, 0, 255, 255]); // red
+        assert!(apply_scroll(&mut page, 2, 2));
+        blit_page(&slot, &page).unwrap();
+        let view = read_fb_pixels(&fb_path, 2, 2);
+        assert_eq!(&view[0..4], &[255, 0, 0, 255]); // blue
         let _ = std::fs::remove_file(&png);
         let _ = std::fs::remove_file(&fb_path);
+    }
+
+    fn read_fb_pixels(path: &std::path::Path, w: u32, h: u32) -> Vec<u8> {
+        let mut f = std::fs::File::open(path).unwrap();
+        let mut hdr = [0u8; 16];
+        use std::io::Read;
+        f.read_exact(&mut hdr).unwrap();
+        let mut px = vec![0u8; w as usize * h as usize * 4];
+        f.read_exact(&mut px).unwrap();
+        px
     }
 }
