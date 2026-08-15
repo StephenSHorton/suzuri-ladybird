@@ -138,7 +138,14 @@ fn headless_into_fb(bin: &Path, fb: &FbSlot, url: &str) -> io::Result<()> {
             .map(|d| d.as_millis())
             .unwrap_or(0)
     ));
-    let status = Command::new(bin)
+    let mut cmd = Command::new(bin);
+    if let Some(dir) = bin.parent() {
+        cmd.current_dir(dir);
+    }
+    if let Ok(src) = env::var("LADYBIRD_SOURCE_DIR") {
+        cmd.env("LADYBIRD_SOURCE_DIR", src);
+    }
+    let status = cmd
         .args([
             "--headless",
             "screenshot",
