@@ -2,3 +2,4 @@ sidecar/target/
 **/*.rs.bk
 .DS_Store
 /ladybird/
+/dist/

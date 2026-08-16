@@ -26,7 +26,20 @@ so the guest does not join a desktop Ladybird.
 
 MCP (eval / screenshot / click) stays later, inside this process.
 
-## Build the guest (today)
+## Install into Suzuri
+
+```bash
+suzuri guest install ladybird
+suzuri guest remove ladybird
+suzuri guest list
+```
+
+That writes `guests/ladybird.json` under the Suzuri config dir. A GitHub
+release zip is used when present; otherwise pass
+`--from /path/to/Ladybird.app` (after `scripts/apply.sh` + a Ladybird build).
+`scripts/package.sh` makes the relocatable zip.
+
+## Build the sidecar (fallback)
 
 ```bash
 cd sidecar
@@ -36,7 +49,7 @@ cargo build --release
 
 Binary: `sidecar/target/release/suzuri-ladybird`.
 
-Drop a manifest (see `manifest/ladybird.json`) in:
+Or drop a manifest (see `manifest/ladybird.json`) in:
 
 | OS | Path |
 | --- | --- |
