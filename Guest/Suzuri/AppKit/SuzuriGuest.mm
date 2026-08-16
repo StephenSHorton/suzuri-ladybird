@@ -104,6 +104,8 @@ void hide_guest_window(NSWindow* window)
     [window setHasShadow:NO];
     [window setIgnoresMouseEvents:YES];
     [window setAlphaValue:1];
+    // Below Suzuri so a leftover 800×600 cannot float as a gray slab.
+    [window setLevel:NSNormalWindowLevel - 1];
     [window setCollectionBehavior:NSWindowCollectionBehaviorTransient
             | NSWindowCollectionBehaviorIgnoresCycle
             | NSWindowCollectionBehaviorStationary
@@ -119,8 +121,18 @@ void hide_all_guest_windows()
     if (NSApp == nil)
         return;
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
-    for (NSWindow* window in [NSApp windows])
+    NSWindow* keep = nil;
+    if (auto* tab = active_tab())
+        keep = [tab.web_view window];
+    for (NSWindow* window in [NSApp windows]) {
         hide_guest_window(window);
+        if (keep != nil && window != keep) {
+            // Startup / popup windows (the gray 800×600). Keep the web view.
+            [window setReleasedWhenClosed:NO];
+            [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
+            [window orderOut:nil];
+        }
+    }
     if (auto* tab = active_tab())
         [tab.web_view handleVisibility:YES];
 }
@@ -210,6 +222,7 @@ void tune_guest_window(Tab* tab)
             [window setStyleMask:NSWindowStyleMaskBorderless];
             [window setHasShadow:NO];
             [window setIgnoresMouseEvents:YES];
+            [window setLevel:NSNormalWindowLevel - 1];
             [window setExcludedFromWindowsMenu:YES];
             [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
             [window setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces
@@ -622,11 +635,7 @@ void start_timer()
         200 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(timer, ^{
         ensure_view();
-        if (auto* tab = active_tab()) {
-            [tab.web_view handleVisibility:YES];
-            if (auto* win = [tab.web_view window])
-                hide_guest_window(win);
-        }
+        hide_all_guest_windows();
         if (g_rt.load_issued)
             blit_viewport();
     });
@@ -653,6 +662,17 @@ void prepare_appkit()
                     usingBlock:^(NSNotification*) {
                         hide_all_guest_windows();
                     }];
+        auto shove_back = ^(NSNotification*) {
+            hide_all_guest_windows();
+        };
+        [nc addObserverForName:NSWindowDidBecomeKeyNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:shove_back];
+        [nc addObserverForName:NSWindowDidBecomeMainNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:shove_back];
     }
     start_timer();
     ensure_view();
