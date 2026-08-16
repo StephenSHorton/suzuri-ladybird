@@ -257,7 +257,7 @@ void tune_guest_window(Tab* tab)
     slog("tune window css=%dx%d fb=%ux%u dpr=%.2f", css_w, css_h, g_rt.fb.width, g_rt.fb.height, dpr);
 }
 
-bool blit_viewport()
+bool blit_viewport(bool throttle = true)
 {
     auto* tab = active_tab();
     auto* bridge = bridge_for(tab);
@@ -266,15 +266,12 @@ bool blit_viewport()
     // Keep the well empty until our URL is in flight — no new-tab flash.
     if (g_rt.url.empty() || is_internal_url(g_rt.url) || !g_rt.load_issued)
         return false;
-    // TabController sets Hidden when the off-screen window is occluded.
-    // Force Visible so WebContent keeps compositing into the well.
-    [tab.web_view handleVisibility:YES];
 
     auto now = std::chrono::steady_clock::now();
     bool scrolling = now < g_rt.scrolling_until;
-    auto min_gap = scrolling ? std::chrono::milliseconds(16) : std::chrono::milliseconds(33);
-    if (!g_rt.force_blit && g_rt.last_blit.time_since_epoch().count() != 0
-        && now - g_rt.last_blit < min_gap)
+    // Compositor frames and live scrolling skip the idle throttle.
+    if (throttle && !scrolling && !g_rt.force_blit && g_rt.last_blit.time_since_epoch().count() != 0
+        && now - g_rt.last_blit < std::chrono::milliseconds(33))
         return false;
 
     auto paintable = bridge->paintable();
@@ -347,7 +344,7 @@ void install_hooks(Tab* tab)
     view.on_ready_to_paint = [prev_paint = move(prev_paint)]() {
         if (prev_paint)
             prev_paint();
-        blit_viewport();
+        blit_viewport(false);
     };
 
     auto prev_title = move(view.on_title_change);
@@ -475,16 +472,18 @@ void scroll_by(Suzuri::HostMessage const& msg)
 {
     if (msg.dx == 0 && msg.dy == 0)
         return;
-    auto* bridge = bridge_for(active_tab());
+    auto* tab = active_tab();
+    auto* bridge = bridge_for(tab);
     if (!bridge)
         return;
 
+    // Native Ladybird sends device px; wheel delta stays CSS points.
     double dpr = g_rt.scale > 0.5 ? static_cast<double>(g_rt.scale) : 1.0;
-    int x = static_cast<int>(msg.rect.x);
-    int y = static_cast<int>(msg.rect.y);
+    int x = static_cast<int>(std::lround(msg.rect.x * dpr));
+    int y = static_cast<int>(std::lround(msg.rect.y * dpr));
     if (x == 0 && y == 0) {
-        x = std::max(1, static_cast<int>(g_rt.fb.width / dpr / 2));
-        y = std::max(1, static_cast<int>(g_rt.fb.height / dpr / 2));
+        x = std::max(1, static_cast<int>(g_rt.fb.width / 2));
+        y = std::max(1, static_cast<int>(g_rt.fb.height / 2));
     }
     Web::MouseEvent event;
     event.type = Web::MouseEvent::Type::MouseWheel;
@@ -493,7 +492,8 @@ void scroll_by(Suzuri::HostMessage const& msg)
     event.button = Web::UIEvents::MouseButton::Middle;
     event.wheel_delta_x = msg.dx;
     event.wheel_delta_y = msg.dy;
-    g_rt.scrolling_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(180);
+    g_rt.scrolling_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(280);
+    g_rt.force_blit = true;
     bridge->enqueue_input_event(move(event));
 }
 
@@ -522,9 +522,13 @@ void pointer_at(Suzuri::HostMessage const& msg)
     if (type == Web::MouseEvent::Type::MouseMove && msg.buttons == 0)
         button = Web::UIEvents::MouseButton::None;
 
+    double dpr = g_rt.scale > 0.5 ? static_cast<double>(g_rt.scale) : 1.0;
     Web::MouseEvent event;
     event.type = type;
-    event.position = { static_cast<int>(msg.rect.x), static_cast<int>(msg.rect.y) };
+    event.position = {
+        static_cast<int>(std::lround(msg.rect.x * dpr)),
+        static_cast<int>(std::lround(msg.rect.y * dpr)),
+    };
     event.screen_position = event.position;
     event.button = button;
     event.buttons = static_cast<Web::UIEvents::MouseButton>(msg.buttons);
@@ -635,9 +639,12 @@ void start_timer()
         200 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(timer, ^{
         ensure_view();
-        hide_all_guest_windows();
+        bool scrolling = std::chrono::steady_clock::now() < g_rt.scrolling_until;
+        // Restacking mid-scroll hitches the well. Idle only.
+        if (!scrolling)
+            hide_all_guest_windows();
         if (g_rt.load_issued)
-            blit_viewport();
+            blit_viewport(!scrolling);
     });
     dispatch_resume(timer);
 }
