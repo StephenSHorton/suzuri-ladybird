@@ -41,7 +41,7 @@ std::uint8_t* map_pixels(Framebuffer& fb)
         return nullptr;
     auto const n = payload_bytes(fb);
     auto const total = 16 + n;
-    if (g_map.p && g_map.path == fb.path && g_map.len == total) {
+    if (g_map.p && g_map.path == fb.path && g_map.len >= total) {
         struct stat st {};
         if (fstat(g_map.fd, &st) == 0 && static_cast<std::size_t>(st.st_size) >= total)
             return g_map.p + 16;
@@ -51,9 +51,13 @@ std::uint8_t* map_pixels(Framebuffer& fb)
     int fd = open(fb.path.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0)
         return nullptr;
-    if (ftruncate(fd, static_cast<off_t>(total)) != 0) {
-        close(fd);
-        return nullptr;
+    struct stat st {};
+    if (fstat(fd, &st) != 0 || static_cast<std::size_t>(st.st_size) < total) {
+        // Grow only — shrinking a file the previous map still holds is SIGBUS.
+        if (ftruncate(fd, static_cast<off_t>(total)) != 0) {
+            close(fd);
+            return nullptr;
+        }
     }
     auto* p = static_cast<std::uint8_t*>(mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
     if (p == MAP_FAILED) {
