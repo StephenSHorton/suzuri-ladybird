@@ -52,6 +52,9 @@ struct GuestRuntime {
     bool force_blit { false };
     std::uint32_t blit_hash { 0 };
     std::chrono::steady_clock::time_point scrolling_until {};
+    std::chrono::steady_clock::time_point resizing_until {};
+    std::chrono::steady_clock::time_point last_viewport {};
+    bool viewport_pending { false };
 };
 
 GuestRuntime g_rt;
@@ -61,7 +64,7 @@ Tab* active_tab();
 
 // Covered by Suzuri chrome so it is not a second browser, but still on a
 // real display so WebContent composites. Off-screen + occlusion = blank well.
-void park_under_host(NSWindow* window, CGFloat css_w, CGFloat css_h)
+void park_under_host(NSWindow* window, CGFloat css_w, CGFloat css_h, bool restack)
 {
     CGWindowID host = kCGNullWindowID;
     CGRect host_b {};
@@ -78,8 +81,8 @@ void park_under_host(NSWindow* window, CGFloat css_w, CGFloat css_h)
     if (info)
         CFRelease(info);
 
-    auto w = css_w > 80 ? css_w : 800;
-    auto h = css_h > 80 ? css_h : 600;
+    auto w = std::max(css_w, 1.0);
+    auto h = std::max(css_h, 1.0);
     if (host != kCGNullWindowID) {
         NSScreen* screen = [NSScreen mainScreen];
         CGFloat sh = NSMaxY(screen.frame);
@@ -87,8 +90,9 @@ void park_under_host(NSWindow* window, CGFloat css_w, CGFloat css_h)
         CGFloat y = sh - (host_b.origin.y + host_b.size.height) + 56;
         NSRect want = NSMakeRect(x, y, w, h);
         if (!NSEqualRects(NSIntegralRect([window frame]), NSIntegralRect(want)))
-            [window setFrame:want display:YES];
-        [window orderWindow:NSWindowBelow relativeTo:static_cast<NSInteger>(host)];
+            [window setFrame:want display:NO];
+        if (restack)
+            [window orderWindow:NSWindowBelow relativeTo:static_cast<NSInteger>(host)];
     } else {
         [window setFrame:NSMakeRect(-20000, -20000, w, h) display:NO];
     }
@@ -113,7 +117,7 @@ void hide_guest_window(NSWindow* window)
     auto frame = [window frame];
     auto w = frame.size.width > 80 ? frame.size.width : 800;
     auto h = frame.size.height > 80 ? frame.size.height : 600;
-    park_under_host(window, w, h);
+    park_under_host(window, w, h, true);
 }
 
 void hide_all_guest_windows()
@@ -245,7 +249,7 @@ void tune_guest_window(Tab* tab)
 
     [window setContentSize:NSMakeSize(css_w, css_h)];
     hide_guest_window(window);
-    park_under_host(window, css_w, css_h);
+    park_under_host(window, css_w, css_h, true);
     [web_view handleVisibility:YES];
 
     if (auto* bridge = bridge_for(tab)) {
@@ -254,7 +258,45 @@ void tune_guest_window(Tab* tab)
     }
 
     g_rt.window_tuned = true;
+    g_rt.last_viewport = std::chrono::steady_clock::now();
+    g_rt.viewport_pending = false;
     slog("tune window css=%dx%d fb=%ux%u dpr=%.2f", css_w, css_h, g_rt.fb.width, g_rt.fb.height, dpr);
+}
+
+void guest_css_size(int& css_w, int& css_h)
+{
+    double dpr = g_rt.scale > 0.5 ? static_cast<double>(g_rt.scale) : 1.0;
+    css_w = std::max(1, static_cast<int>(std::lround(g_rt.fb.width / dpr)));
+    css_h = std::max(1, static_cast<int>(std::lround(g_rt.fb.height / dpr)));
+}
+
+void cover_guest_window()
+{
+    auto* tab = active_tab();
+    if (tab == nil || g_rt.fb.width == 0)
+        return;
+    int css_w = 1, css_h = 1;
+    guest_css_size(css_w, css_h);
+    if (auto* window = [tab.web_view window])
+        park_under_host(window, css_w, css_h, false);
+}
+
+void commit_guest_viewport()
+{
+    auto* tab = active_tab();
+    auto* bridge = bridge_for(tab);
+    if (!tab || !bridge || g_rt.fb.width == 0)
+        return;
+    int css_w = 1, css_h = 1;
+    guest_css_size(css_w, css_h);
+    if (auto* window = [tab.web_view window]) {
+        [window setContentSize:NSMakeSize(css_w, css_h)];
+        park_under_host(window, css_w, css_h, false);
+    }
+    bridge->set_viewport_rect(Gfx::IntRect { 0, 0, css_w, css_h });
+    [tab.web_view handleVisibility:YES];
+    g_rt.last_viewport = std::chrono::steady_clock::now();
+    g_rt.viewport_pending = false;
 }
 
 bool blit_viewport(bool throttle = true)
@@ -434,19 +476,27 @@ void apply_fb(Suzuri::HostMessage const& msg)
     g_rt.fb = *msg.fb;
     if (msg.scale > 0)
         g_rt.scale = msg.scale;
-    slog("fb %s %ux%u scale=%.2f", g_rt.fb.path.c_str(), g_rt.fb.width, g_rt.fb.height, g_rt.scale);
     if (same) {
-        if (auto* tab = active_tab())
-            [tab.web_view handleVisibility:YES];
         blit_viewport();
         return;
     }
+    g_rt.resizing_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(160);
+    if (g_rt.window_tuned) {
+        // Split/sash: keep the helper covered, but do not rebuild WebContent
+        // or flash a placeholder on every jelly frame.
+        cover_guest_window();
+        g_rt.viewport_pending = true;
+        auto now = std::chrono::steady_clock::now();
+        if (g_rt.last_viewport.time_since_epoch().count() == 0
+            || now - g_rt.last_viewport > std::chrono::milliseconds(90))
+            commit_guest_viewport();
+        blit_viewport(false);
+        return;
+    }
+    slog("fb %s %ux%u scale=%.2f", g_rt.fb.path.c_str(), g_rt.fb.width, g_rt.fb.height, g_rt.scale);
     g_rt.window_tuned = false;
     ensure_view();
-    if (!blit_viewport() && !g_rt.fb.path.empty()) {
-        Suzuri::paint_placeholder(g_rt.fb, g_rt.url);
-        send_surface();
-    }
+    blit_viewport(false);
 }
 
 void navigate(std::string url)
@@ -639,12 +689,16 @@ void start_timer()
         200 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(timer, ^{
         ensure_view();
-        bool scrolling = std::chrono::steady_clock::now() < g_rt.scrolling_until;
-        // Restacking mid-scroll hitches the well. Idle only.
-        if (!scrolling)
+        auto now = std::chrono::steady_clock::now();
+        bool scrolling = now < g_rt.scrolling_until;
+        bool resizing = now < g_rt.resizing_until;
+        if (g_rt.viewport_pending && !resizing)
+            commit_guest_viewport();
+        // Restacking mid-scroll/resize hitches the well. Idle only.
+        if (!scrolling && !resizing)
             hide_all_guest_windows();
         if (g_rt.load_issued)
-            blit_viewport(!scrolling);
+            blit_viewport(!scrolling && !resizing);
     });
     dispatch_resume(timer);
 }
