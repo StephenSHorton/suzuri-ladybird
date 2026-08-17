@@ -243,5 +243,118 @@ print("patched", p)
 PY
 fi
 
+bridge_cpp="$dest/UI/AppKit/Interface/LadybirdWebViewBridge.cpp"
+if ! grep -q "SUZURI_GUEST_PORT" "$bridge_cpp"; then
+  python3 - "$bridge_cpp" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+if "<cstdlib>" not in t:
+    t = t.replace(
+        "#include <LibWebView/Application.h>\n",
+        "#include <LibWebView/Application.h>\n#include <cstdlib>\n",
+        1,
+    )
+old = """    m_device_pixel_ratio = device_pixel_ratio;
+    m_display_id = display_id;
+    m_maximum_frames_per_second = static_cast<double>(maximum_frames_per_second);
+    set_page_background_color_to_system_canvas(is_using_dark_system_theme());
+}
+"""
+new = """    m_device_pixel_ratio = device_pixel_ratio;
+    m_display_id = display_id;
+    m_maximum_frames_per_second = static_cast<double>(maximum_frames_per_second);
+    set_page_background_color_to_system_canvas(is_using_dark_system_theme());
+    // Guest chrome presents the compositor IOSurface. Start Visible so
+    // initialize_client tells WebContent to paint before any window
+    // occlusion can mark the document Hidden.
+    if (getenv("SUZURI_GUEST_PORT") != nullptr)
+        m_top_level_traversable.set_system_visibility_state(Web::HTML::VisibilityState::Visible);
+}
+"""
+if old not in t:
+    raise SystemExit("LadybirdWebViewBridge.cpp: constructor tail not found — rebase overlay")
+t = t.replace(old, new, 1)
+old = """    if (m_client_state.has_usable_bitmap) {
+        shared_image_buffer = m_client_state.front_bitmap.shared_image_buffer.ptr();
+        bitmap_size = m_client_state.front_bitmap.last_painted_size.to_type<int>();
+    } else {
+        shared_image_buffer = m_backup_shared_image_buffer.ptr();
+        bitmap_size = m_backup_bitmap_size.to_type<int>();
+    }
+"""
+new = """    if (m_client_state.has_usable_bitmap) {
+        shared_image_buffer = m_client_state.front_bitmap.shared_image_buffer.ptr();
+        bitmap_size = m_client_state.front_bitmap.last_painted_size.to_type<int>();
+    } else {
+        shared_image_buffer = m_backup_shared_image_buffer.ptr();
+        bitmap_size = m_backup_bitmap_size.to_type<int>();
+    }
+    // Backing stores exist before the first present. Guest chrome can
+    // import that IOSurface as soon as the compositor allocates it.
+    if (!shared_image_buffer && m_client_state.front_bitmap.shared_image_buffer) {
+        shared_image_buffer = m_client_state.front_bitmap.shared_image_buffer.ptr();
+        bitmap_size = m_viewport_size;
+    }
+"""
+if old not in t:
+    raise SystemExit("LadybirdWebViewBridge.cpp: paintable() body not found — rebase overlay")
+p.write_text(t.replace(old, new, 1))
+print("patched", p)
+PY
+fi
+
+view_mm="$dest/UI/AppKit/Interface/LadybirdWebView.mm"
+if ! grep -A3 "handleDisplayRefreshRateChange" "$view_mm" | grep -q "mainScreen"; then
+  python3 - "$view_mm" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+old = """- (void)handleDisplayRefreshRateChange
+{
+    auto* screen = [[self window] screen];
+    m_web_view_bridge->set_display_metadata([screen maximumFramesPerSecond], display_id_for_screen(screen));
+}
+"""
+new = """- (void)handleDisplayRefreshRateChange
+{
+    auto* screen = [[self window] screen] ?: [NSScreen mainScreen];
+    m_web_view_bridge->set_display_metadata([screen maximumFramesPerSecond], display_id_for_screen(screen));
+}
+"""
+if old not in t:
+    raise SystemExit("LadybirdWebView.mm: handleDisplayRefreshRateChange not found — rebase overlay")
+p.write_text(t.replace(old, new, 1))
+print("patched", p)
+PY
+fi
+
+if ! grep -q 'screen] == nil' "$tabc"; then
+  python3 - "$tabc" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+old = """- (void)windowDidChangeScreen:(NSNotification*)notification
+{
+    [[[self tab] web_view] handleDisplayRefreshRateChange];
+}
+"""
+new = """- (void)windowDidChangeScreen:(NSNotification*)notification
+{
+    if (getenv("SUZURI_GUEST_PORT") != nullptr && [self.window screen] == nil)
+        return;
+    [[[self tab] web_view] handleDisplayRefreshRateChange];
+}
+"""
+if old not in t:
+    raise SystemExit("TabController.mm: windowDidChangeScreen not found — rebase overlay")
+p.write_text(t.replace(old, new, 1))
+print("patched", p)
+PY
+fi
+
 echo "overlay applied under $dest/UI/AppKit/Suzuri"
 echo "build Ladybird as usual, then point suzuri's ladybird.json command at the Ladybird binary."

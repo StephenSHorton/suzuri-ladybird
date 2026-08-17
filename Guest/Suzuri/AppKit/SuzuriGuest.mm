@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <thread>
@@ -59,8 +60,10 @@ struct GuestRuntime {
     std::chrono::steady_clock::time_point resizing_until {};
     std::chrono::steady_clock::time_point last_viewport {};
     bool viewport_pending { false };
+    bool visibility_forced { false };
     std::uint32_t surface_seq { 0 };
     std::uint64_t last_iosurface_id { 0 };
+    std::chrono::steady_clock::time_point last_blit_skip {};
 };
 
 GuestRuntime g_rt;
@@ -78,6 +81,38 @@ void pin_page_visible(Tab* tab)
         bridge->set_system_visibility_state(Web::HTML::VisibilityState::Visible);
 }
 
+// Hidden → Visible so WebContent cannot miss the first Visible IPC
+// (set_system_visibility_state no-ops when the UI process already
+// thinks the page is Visible).
+void force_page_visible(Tab* tab)
+{
+    if (tab == nil)
+        return;
+    if (auto* bridge = bridge_for(tab)) {
+        bridge->set_system_visibility_state(Web::HTML::VisibilityState::Hidden);
+        bridge->set_system_visibility_state(Web::HTML::VisibilityState::Visible);
+    }
+    [tab.web_view handleVisibility:YES];
+    g_rt.visibility_forced = true;
+}
+
+void apply_display_metadata(Ladybird::WebViewBridge* bridge)
+{
+    if (!bridge)
+        return;
+    NSScreen* screen = [NSScreen mainScreen];
+    if (screen == nil)
+        return;
+    u64 fps = 60;
+    if ([screen respondsToSelector:@selector(maximumFramesPerSecond)])
+        fps = static_cast<u64>(std::max<NSInteger>(1, screen.maximumFramesPerSecond));
+    NSNumber* num = screen.deviceDescription[@"NSScreenNumber"];
+    AK::Optional<u64> display_id;
+    if (num)
+        display_id = static_cast<u64>(num.unsignedIntValue);
+    bridge->set_display_metadata(fps, display_id);
+}
+
 void hide_guest_window(NSWindow* window)
 {
     if (window == nil)
@@ -87,13 +122,17 @@ void hide_guest_window(NSWindow* window)
     [window setExcludedFromWindowsMenu:YES];
     [window setHasShadow:NO];
     [window setIgnoresMouseEvents:YES];
+    [window setAlphaValue:0];
     [window setCollectionBehavior:NSWindowCollectionBehaviorTransient
             | NSWindowCollectionBehaviorIgnoresCycle
-            | NSWindowCollectionBehaviorStationary];
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorCanJoinAllSpaces];
     [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
-    // Not a presenter. Visibility is pinned in guest mode so orderOut
-    // does not mark the document Hidden.
-    [window orderOut:nil];
+    // Stay attached to a real display. orderOut clears the window's
+    // screen (display_id / vsync) and AppKit marks the view Hidden,
+    // so WebContent never presents an IOSurface. Chrome is still the
+    // presenter; this window is only a compositor source.
+    [window orderBack:nil];
 }
 
 void hide_all_guest_windows()
@@ -105,13 +144,16 @@ void hide_all_guest_windows()
     if (auto* tab = active_tab())
         keep = [tab.web_view window];
     for (NSWindow* window in [NSApp windows]) {
-        hide_guest_window(window);
-        if (keep != nil && window != keep) {
-            // Startup / popup windows (the gray 800×600). Keep the web view.
-            [window setReleasedWhenClosed:NO];
-            [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
-            [window orderOut:nil];
+        if (keep != nil && window == keep) {
+            hide_guest_window(window);
+            continue;
         }
+        // Startup / popup windows (the gray 800×600). Keep the web view.
+        [window setReleasedWhenClosed:NO];
+        [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
+        [window setAlphaValue:0];
+        [window setIgnoresMouseEvents:YES];
+        [window orderOut:nil];
     }
     pin_page_visible(active_tab());
 }
@@ -217,21 +259,11 @@ void tune_guest_window(Tab* tab)
 
     [window setContentSize:NSMakeSize(css_w, css_h)];
     hide_guest_window(window);
-    pin_page_visible(tab);
+    force_page_visible(tab);
 
     if (auto* bridge = bridge_for(tab)) {
-        bridge->set_system_visibility_state(Web::HTML::VisibilityState::Visible);
         bridge->set_viewport_rect(Gfx::IntRect { 0, 0, css_w, css_h });
-        if (auto* screen = [NSScreen mainScreen]) {
-            u64 fps = 60;
-            if ([screen respondsToSelector:@selector(maximumFramesPerSecond)])
-                fps = static_cast<u64>(std::max<NSInteger>(1, screen.maximumFramesPerSecond));
-            NSNumber* num = screen.deviceDescription[@"NSScreenNumber"];
-            AK::Optional<u64> display_id;
-            if (num)
-                display_id = static_cast<u64>(num.unsignedIntValue);
-            bridge->set_display_metadata(fps, display_id);
-        }
+        apply_display_metadata(bridge);
     }
 
     g_rt.window_tuned = true;
@@ -273,37 +305,66 @@ void commit_guest_viewport()
     g_rt.viewport_pending = false;
 }
 
+void log_blit_skip(char const* why)
+{
+    auto now = std::chrono::steady_clock::now();
+    if (g_rt.last_blit_skip.time_since_epoch().count() != 0
+        && now - g_rt.last_blit_skip < std::chrono::seconds(1))
+        return;
+    g_rt.last_blit_skip = now;
+    slog("blit skip %s", why);
+}
+
 bool blit_viewport(bool throttle = true)
 {
     auto* tab = active_tab();
     auto* bridge = bridge_for(tab);
-    if (!bridge)
+    if (!bridge) {
+        log_blit_skip("no-bridge");
         return false;
-    if (g_rt.url.empty() || is_internal_url(g_rt.url) || !g_rt.load_issued)
+    }
+    if (g_rt.url.empty() || is_internal_url(g_rt.url) || !g_rt.load_issued) {
+        log_blit_skip("no-url");
         return false;
-    if (!g_rt.session)
+    }
+    if (!g_rt.session) {
+        log_blit_skip("no-session");
         return false;
+    }
 
     auto now = std::chrono::steady_clock::now();
     bool scrolling = now < g_rt.scrolling_until;
-    if (throttle && !scrolling && !g_rt.force_blit && g_rt.last_blit.time_since_epoch().count() != 0
-        && now - g_rt.last_blit < std::chrono::milliseconds(8))
+    // Double-buffered presents flip the IOSurface id every vsync.
+    // Cap chrome imports even from on_ready_to_paint (throttle=false).
+    int gap_ms = 8;
+    if (throttle && !scrolling && !g_rt.force_blit)
+        gap_ms = 32;
+    else if (!g_rt.force_blit && !scrolling)
+        gap_ms = 16;
+    if (g_rt.last_blit.time_since_epoch().count() != 0
+        && now - g_rt.last_blit < std::chrono::milliseconds(gap_ms))
         return false;
 
     auto paintable = bridge->paintable();
-    if (!paintable.has_value() || !paintable->shared_image_buffer)
+    if (!paintable.has_value() || !paintable->shared_image_buffer) {
+        log_blit_skip("no-paintable");
         return false;
+    }
 
     auto* surf = static_cast<IOSurfaceRef>(
         paintable->shared_image_buffer->iosurface_handle().core_foundation_pointer());
-    if (!surf)
+    if (!surf) {
+        log_blit_skip("no-iosurface");
         return false;
+    }
 
     auto const id = static_cast<std::uint64_t>(IOSurfaceGetID(surf));
     auto const w = static_cast<std::uint32_t>(IOSurfaceGetWidth(surf));
     auto const h = static_cast<std::uint32_t>(IOSurfaceGetHeight(surf));
-    if (id == 0 || w == 0 || h == 0)
+    if (id == 0 || w == 0 || h == 0) {
+        log_blit_skip("empty-iosurface");
         return false;
+    }
 
     if (!scrolling && !g_rt.force_blit && id == g_rt.last_iosurface_id
         && g_rt.last_blit.time_since_epoch().count() != 0)
@@ -314,6 +375,8 @@ bool blit_viewport(bool throttle = true)
     g_rt.force_blit = false;
     g_rt.last_blit = now;
     g_rt.session->send_iosurface(id, w, h, g_rt.surface_seq);
+    slog("iosurface id=%llu %ux%u seq=%u",
+        static_cast<unsigned long long>(id), w, h, g_rt.surface_seq);
     return true;
 }
 
@@ -382,7 +445,10 @@ void install_hooks(Tab* tab)
             g_rt.session->send_busy(false);
         g_rt.last_blit = {};
         g_rt.force_blit = true;
-        blit_viewport();
+        force_page_visible(active_tab());
+        if (auto* b = bridge_for(active_tab()))
+            apply_display_metadata(b);
+        blit_viewport(false);
     };
 
     // Synthetic JSON keys have no NSEvent. Ladybird's default finish
@@ -639,7 +705,10 @@ void start_timer()
         bool resizing = now < g_rt.resizing_until;
         if (g_rt.viewport_pending && !resizing)
             commit_guest_viewport();
-        pin_page_visible(active_tab());
+        if (!g_rt.visibility_forced)
+            force_page_visible(active_tab());
+        else
+            pin_page_visible(active_tab());
         if (g_rt.load_issued)
             blit_viewport(!scrolling && !resizing);
     });
@@ -732,6 +801,11 @@ int suzuri_guest_try_start(int argc, char const* const* argv)
     if (!port)
         return 0;
     g_is_guest = true;
+    // Occlusion / last-window patches key off this. Chrome sets it too;
+    // set it here so a missing env still keeps WebContent Visible.
+    char port_buf[16];
+    std::snprintf(port_buf, sizeof(port_buf), "%u", static_cast<unsigned>(*port));
+    setenv("SUZURI_GUEST_PORT", port_buf, 0);
     dispatch_async(dispatch_get_main_queue(), ^{
         hide_all_guest_windows();
     });
