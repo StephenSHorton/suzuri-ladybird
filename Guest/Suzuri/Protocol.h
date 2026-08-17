@@ -46,6 +46,7 @@ struct HostMessage {
     std::string key;
     std::string text;
     std::optional<Framebuffer> fb;
+    std::string mach;
 };
 
 class Session {

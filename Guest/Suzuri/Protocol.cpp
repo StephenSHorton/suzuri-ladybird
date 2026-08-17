@@ -273,6 +273,7 @@ HostMessage parse_host_line(std::string const& line)
         m.buttons = static_cast<int>(*b);
     if (auto mods = json_number(line, "modifiers"))
         m.modifiers = static_cast<int>(*mods);
+    m.mach = json_string(line, "mach").value_or("");
     if (auto path = json_string(line, "path")) {
         Framebuffer fb;
         fb.path = *path;

@@ -31,6 +31,10 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CGWindow.h>
 #import <IOSurface/IOSurface.h>
+#import <mach/mach.h>
+
+extern "C" mach_port_t bootstrap_port;
+extern "C" kern_return_t bootstrap_look_up(mach_port_t, char const*, mach_port_t*);
 
 #if !__has_feature(objc_arc)
 #    error "Suzuri guest requires ARC"
@@ -68,6 +72,65 @@ struct GuestRuntime {
 
 GuestRuntime g_rt;
 bool g_is_guest { false };
+mach_port_t g_chrome_port { MACH_PORT_NULL };
+
+bool send_surface_port(IOSurfaceRef surf)
+{
+    if (g_chrome_port == MACH_PORT_NULL || surf == nullptr)
+        return false;
+    mach_port_t sp = IOSurfaceCreateMachPort(surf);
+    if (sp == MACH_PORT_NULL)
+        return false;
+    struct {
+        mach_msg_header_t header;
+        mach_msg_body_t body;
+        mach_msg_port_descriptor_t port;
+    } msg {};
+    msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+    msg.header.msgh_size = sizeof(msg);
+    msg.header.msgh_remote_port = g_chrome_port;
+    msg.header.msgh_local_port = MACH_PORT_NULL;
+    msg.header.msgh_id = 1;
+    msg.body.msgh_descriptor_count = 1;
+    msg.port.name = sp;
+    msg.port.disposition = MACH_MSG_TYPE_MOVE_SEND;
+    msg.port.type = MACH_MSG_PORT_DESCRIPTOR;
+    auto kr = mach_msg(&msg.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(msg), 0,
+        MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    if (kr != MACH_MSG_SUCCESS) {
+        mach_port_deallocate(mach_task_self(), sp);
+        return false;
+    }
+    return true;
+}
+
+void copy_iosurface_to_fb(IOSurfaceRef surf)
+{
+    if (surf == nullptr || g_rt.fb.width == 0 || g_rt.fb.height == 0)
+        return;
+    auto* dest = Suzuri::map_pixels(g_rt.fb);
+    if (!dest)
+        return;
+    IOSurfaceLock(surf, kIOSurfaceLockReadOnly, nullptr);
+    auto* src = static_cast<std::uint8_t const*>(IOSurfaceGetBaseAddress(surf));
+    if (!src) {
+        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, nullptr);
+        return;
+    }
+    auto src_bpr = IOSurfaceGetBytesPerRow(surf);
+    auto sw = IOSurfaceGetWidth(surf);
+    auto sh = IOSurfaceGetHeight(surf);
+    auto dw = static_cast<std::size_t>(g_rt.fb.width);
+    auto dh = static_cast<std::size_t>(g_rt.fb.height);
+    auto rows = std::min<std::size_t>(sh, dh);
+    auto cols = std::min<std::size_t>(sw, dw);
+    for (std::size_t y = 0; y < rows; ++y)
+        std::memcpy(dest + y * dw * 4, src + y * src_bpr, cols * 4);
+    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, nullptr);
+    Suzuri::publish_szfb(g_rt.fb);
+    if (g_rt.session)
+        g_rt.session->send_surface(g_rt.fb);
+}
 
 Tab* active_tab();
 Ladybird::WebViewBridge* bridge_for(Tab* tab);
@@ -171,6 +234,22 @@ void slog(char const* fmt, ...)
     va_end(ap);
     std::fputc('\n', f);
     std::fclose(f);
+}
+
+void attach_chrome_mach(std::string const& name)
+{
+    if (name.empty())
+        return;
+    mach_port_t port = MACH_PORT_NULL;
+    auto kr = bootstrap_look_up(bootstrap_port, name.c_str(), &port);
+    if (kr != KERN_SUCCESS || port == MACH_PORT_NULL) {
+        slog("mach look_up %s fail %d", name.c_str(), static_cast<int>(kr));
+        return;
+    }
+    if (g_chrome_port != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), g_chrome_port);
+    g_chrome_port = port;
+    slog("mach look_up %s ok", name.c_str());
 }
 
 bool is_internal_url(std::string const& url)
@@ -375,8 +454,11 @@ bool blit_viewport(bool throttle = true)
     g_rt.force_blit = false;
     g_rt.last_blit = now;
     g_rt.session->send_iosurface(id, w, h, g_rt.surface_seq);
-    slog("iosurface id=%llu %ux%u seq=%u",
-        static_cast<unsigned long long>(id), w, h, g_rt.surface_seq);
+    bool sent = send_surface_port(surf);
+    if (!sent)
+        copy_iosurface_to_fb(surf);
+    slog("iosurface id=%llu %ux%u seq=%u mach=%d",
+        static_cast<unsigned long long>(id), w, h, g_rt.surface_seq, sent ? 1 : 0);
     return true;
 }
 
@@ -485,6 +567,8 @@ void try_load()
 
 void apply_fb(Suzuri::HostMessage const& msg)
 {
+    if (!msg.mach.empty())
+        attach_chrome_mach(msg.mach);
     if (!msg.fb)
         return;
     bool const same = g_rt.fb.path == msg.fb->path && g_rt.fb.width == msg.fb->width
