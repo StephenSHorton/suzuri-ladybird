@@ -357,6 +357,50 @@ print("patched", p)
 PY
 fi
 
+if ! grep -q "Guest chrome is not a live window drag" "$bridge_cpp"; then
+  python3 - "$bridge_cpp" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+if "<LibWeb/Compositor/Types.h>" not in t:
+    t = t.replace(
+        "#include <LibWebView/Application.h>\n",
+        "#include <LibWeb/Compositor/Types.h>\n#include <LibWebView/Application.h>\n",
+        1,
+    )
+old = """void WebViewBridge::set_viewport_rect(Gfx::IntRect viewport_rect)
+{
+    viewport_rect.set_size(scale_for_device(viewport_rect.size(), device_pixel_ratio()));
+    m_viewport_size = viewport_rect.size();
+
+    handle_resize();
+}
+"""
+new = """void WebViewBridge::set_viewport_rect(Gfx::IntRect viewport_rect)
+{
+    viewport_rect.set_size(scale_for_device(viewport_rect.size(), device_pixel_ratio()));
+    m_viewport_size = viewport_rect.size();
+
+    handle_resize();
+    // handle_resize always marks WindowResizingInProgress. That pads the
+    // backing store and waits 3s to shrink — the Suzuri well flickers for
+    // those 3s. Guest chrome is not a live window drag; snap the store now.
+    if (getenv("SUZURI_GUEST_PORT") != nullptr && m_client_state.client) {
+        WebView::Application::the().update_compositor_viewport(
+            client().compositor_context_id_for_page(page_id()),
+            viewport_size().to_type<int>(),
+            Web::Compositor::WindowResizingInProgress::No);
+    }
+}
+"""
+if old not in t:
+    raise SystemExit("LadybirdWebViewBridge.cpp: set_viewport_rect not found — rebase overlay")
+p.write_text(t.replace(old, new, 1))
+print("patched", p)
+PY
+fi
+
 view_mm="$dest/UI/AppKit/Interface/LadybirdWebView.mm"
 if ! grep -A2 "handleResize" "$view_mm" | grep -q "SUZURI_GUEST_PORT"; then
   python3 - "$view_mm" <<'PY'

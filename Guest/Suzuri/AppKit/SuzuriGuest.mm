@@ -65,6 +65,7 @@ struct GuestRuntime {
     std::chrono::steady_clock::time_point last_viewport {};
     bool viewport_pending { false };
     bool visibility_forced { false };
+    std::chrono::steady_clock::time_point settling_until {};
     std::uint32_t surface_seq { 0 };
     std::uint64_t last_iosurface_id { 0 };
     std::chrono::steady_clock::time_point last_blit_skip {};
@@ -385,6 +386,8 @@ void commit_guest_viewport()
     pin_page_visible(tab);
     g_rt.last_viewport = std::chrono::steady_clock::now();
     g_rt.viewport_pending = false;
+    // One quiet beat so the first paint at the new size is the one we send.
+    g_rt.settling_until = g_rt.last_viewport + std::chrono::milliseconds(80);
 }
 
 void log_blit_skip(char const* why)
@@ -416,6 +419,9 @@ bool blit_viewport(bool throttle = true)
 
     auto now = std::chrono::steady_clock::now();
     bool scrolling = now < g_rt.scrolling_until;
+    if ((g_rt.viewport_pending || now < g_rt.resizing_until || now < g_rt.settling_until)
+        && !g_rt.force_blit)
+        return false;
     // Double-buffered presents flip the IOSurface id every vsync.
     // Cap chrome imports even from on_ready_to_paint (throttle=false).
     int gap_ms = 8;
@@ -593,17 +599,13 @@ void apply_fb(Suzuri::HostMessage const& msg)
         blit_viewport();
         return;
     }
-    g_rt.resizing_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(160);
+    g_rt.resizing_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
     if (g_rt.window_tuned) {
-        // Split/sash: keep the helper covered, but do not rebuild WebContent
-        // or flash a placeholder on every jelly frame.
+        // Split/sash: hold the last presented frame. Commit the viewport
+        // after the sash is quiet so we do not realloc backing stores
+        // on every jelly pixel.
         cover_guest_window();
         g_rt.viewport_pending = true;
-        auto now = std::chrono::steady_clock::now();
-        if (g_rt.last_viewport.time_since_epoch().count() == 0
-            || now - g_rt.last_viewport > std::chrono::milliseconds(90))
-            commit_guest_viewport();
-        blit_viewport(false);
         return;
     }
     slog("fb %s %ux%u scale=%.2f", g_rt.fb.path.c_str(), g_rt.fb.width, g_rt.fb.height, g_rt.scale);
