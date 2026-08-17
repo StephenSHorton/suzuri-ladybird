@@ -385,6 +385,10 @@ void install_hooks(Tab* tab)
         blit_viewport();
     };
 
+    // Synthetic JSON keys have no NSEvent. Ladybird's default finish
+    // handler VERIFY-crashes in key_event_to_ns_event (OwnPtr).
+    view.on_finish_handling_key_event = [](Web::KeyEvent const&) {};
+
     g_rt.hooked = web_view;
     slog("hooks installed");
 }
