@@ -172,6 +172,58 @@ print("patched", p)
 PY
 fi
 
+if ! grep -q "Guest chrome owns the first document" "$del_mm"; then
+  python3 - "$del_mm" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+old = """    if (browser_options.devtools_port.has_value())
+        [self onDevtoolsEnabled];
+
+    Tab* tab = nil;
+"""
+new = """    if (browser_options.devtools_port.has_value())
+        [self onDevtoolsEnabled];
+
+    // Guest chrome owns the first document. A default about:newtab window
+    // would flash on screen before the overlay can hide it.
+    if (getenv("SUZURI_GUEST_PORT") != nullptr)
+        return;
+
+    Tab* tab = nil;
+"""
+if old not in t:
+    raise SystemExit("ApplicationDelegate.mm: didFinishLaunching body not found — rebase overlay")
+t = t.replace(old, new, 1)
+old = """    [controller showWindow:nil];
+
+    if (tab_for_location) {
+"""
+new = """    if (getenv("SUZURI_GUEST_PORT") != nullptr) {
+        NSWindow* window = [controller window];
+        [window setAlphaValue:0];
+        [window setIgnoresMouseEvents:YES];
+        [window setHasShadow:NO];
+        [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
+        [controller showWindow:nil];
+        [window setAlphaValue:0];
+        [window orderBack:nil];
+        [self.managed_tabs addObject:controller];
+        return;
+    }
+
+    [controller showWindow:nil];
+
+    if (tab_for_location) {
+"""
+if old not in t:
+    raise SystemExit("ApplicationDelegate.mm: showWindow not found — rebase overlay")
+p.write_text(t.replace(old, new, 1))
+print("patched", p)
+PY
+fi
+
 tabc="$dest/UI/AppKit/Interface/TabController.mm"
 if ! grep -q "SUZURI_GUEST_PORT" "$tabc"; then
   python3 - "$tabc" <<'PY'
@@ -306,6 +358,58 @@ PY
 fi
 
 view_mm="$dest/UI/AppKit/Interface/LadybirdWebView.mm"
+if ! grep -A2 "handleResize" "$view_mm" | grep -q "SUZURI_GUEST_PORT"; then
+  python3 - "$view_mm" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+if "<cstdlib>" not in t:
+    t = t.replace(
+        "#include <LibWebView/Utilities.h>\n",
+        "#include <LibWebView/Utilities.h>\n#include <cstdlib>\n",
+        1,
+    )
+old = """- (void)handleResize
+{
+    auto size = Ladybird::ns_size_to_gfx_size([[self window] frame].size);
+"""
+new = """- (void)handleResize
+{
+    if (getenv("SUZURI_GUEST_PORT") != nullptr)
+        return;
+    auto size = Ladybird::ns_size_to_gfx_size([[self window] frame].size);
+"""
+if old not in t:
+    raise SystemExit("LadybirdWebView.mm: handleResize not found — rebase overlay")
+p.write_text(t.replace(old, new, 1))
+print("patched", p)
+PY
+fi
+
+if ! grep -A3 "windowDidResize" "$tabc" | grep -q "SUZURI_GUEST_PORT"; then
+  python3 - "$tabc" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+old = """- (void)windowDidResize:(NSNotification*)notification
+{
+    [self.autocomplete close];
+"""
+new = """- (void)windowDidResize:(NSNotification*)notification
+{
+    if (getenv("SUZURI_GUEST_PORT") != nullptr)
+        return;
+    [self.autocomplete close];
+"""
+if old not in t:
+    raise SystemExit("TabController.mm: windowDidResize not found — rebase overlay")
+p.write_text(t.replace(old, new, 1))
+print("patched", p)
+PY
+fi
+
 if ! grep -A3 "handleDisplayRefreshRateChange" "$view_mm" | grep -q "mainScreen"; then
   python3 - "$view_mm" <<'PY'
 from pathlib import Path

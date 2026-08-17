@@ -305,6 +305,9 @@ void tune_guest_window(Tab* tab)
     if (window == nil)
         return;
 
+    [window setAlphaValue:0];
+    [window setIgnoresMouseEvents:YES];
+
     // titlebarAccessoryViewControllers asserts on a borderless window.
     if ((window.styleMask & NSWindowStyleMaskTitled) != 0) {
         @try {
@@ -438,9 +441,19 @@ bool blit_viewport(bool throttle = true)
     }
 
     auto const id = static_cast<std::uint64_t>(IOSurfaceGetID(surf));
-    auto const w = static_cast<std::uint32_t>(IOSurfaceGetWidth(surf));
-    auto const h = static_cast<std::uint32_t>(IOSurfaceGetHeight(surf));
-    if (id == 0 || w == 0 || h == 0) {
+    auto const sw = static_cast<std::uint32_t>(IOSurfaceGetWidth(surf));
+    auto const sh = static_cast<std::uint32_t>(IOSurfaceGetHeight(surf));
+    // Backing stores are padded while resizing. Blit the painted
+    // viewport, not the whole IOSurface, or the page sits in the
+    // top-left of the well with empty/white around it.
+    auto painted = paintable->bitmap_size;
+    auto w = painted.width() > 0 ? static_cast<std::uint32_t>(painted.width()) : sw;
+    auto h = painted.height() > 0 ? static_cast<std::uint32_t>(painted.height()) : sh;
+    if (sw > 0)
+        w = std::min(w, sw);
+    if (sh > 0)
+        h = std::min(h, sh);
+    if (id == 0 || w < 8 || h < 8) {
         log_blit_skip("empty-iosurface");
         return false;
     }
@@ -457,8 +470,8 @@ bool blit_viewport(bool throttle = true)
     bool sent = send_surface_port(surf);
     if (!sent)
         copy_iosurface_to_fb(surf);
-    slog("iosurface id=%llu %ux%u seq=%u mach=%d",
-        static_cast<unsigned long long>(id), w, h, g_rt.surface_seq, sent ? 1 : 0);
+    slog("iosurface id=%llu %ux%u (surf %ux%u) seq=%u mach=%d",
+        static_cast<unsigned long long>(id), w, h, sw, sh, g_rt.surface_seq, sent ? 1 : 0);
     return true;
 }
 
@@ -818,6 +831,12 @@ void prepare_appkit()
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification*) {
                         pin_page_visible(active_tab());
+                    }];
+        [nc addObserverForName:NSWindowDidBecomeKeyNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification* n) {
+                        hide_guest_window(n.object);
                     }];
     }
     start_timer();
