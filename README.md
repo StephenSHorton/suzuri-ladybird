@@ -11,18 +11,20 @@ Pinned upstream: see [`UPSTREAM`](UPSTREAM) (`LadybirdBrowser/ladybird` @ `accee
 ## What chrome talks to
 
 Suzuri chrome spawns a guest with `--suzuri-guest --port N`. The process
-speaks line-delimited JSON on `127.0.0.1` and paints a `SZFB` file that
-chrome blits into the mosaic well.
+speaks line-delimited JSON on `127.0.0.1`. Ladybird presents compositor
+IOSurfaces over a Mach send-right; chrome imports them and blits into
+the mosaic well. `SZFB` file blit remains the fallback for the example
+guest.
 
 Until Ladybird is built and the overlay is applied, the **Rust guest**
 in `sidecar/` is that process. It is titled `Ladybird` and still has a
 headless screenshot fallback (slow: one process per navigate).
 
-The overlay (`Guest/Suzuri/`) is the live path: one Ladybird, `navigate`
-calls `loadURL`, `scroll` / `pointer` / `key` go to the WebView, and
-changed viewport frames copy into SZFB. Point the manifest `command` at
-the Ladybird binary after `scripts/apply.sh`. Pass `--temporary-profile`
-so the guest does not join a desktop Ladybird.
+The overlay (`Guest/Suzuri/`) is the live path: one Ladybird, no
+user-facing window, `navigate` calls `loadURL`, and input is JSON.
+Point the manifest `command` at the Ladybird binary after
+`scripts/apply.sh`. Pass `--temporary-profile` so the guest does not
+join a desktop Ladybird.
 
 MCP (eval / screenshot / click) stays later, inside this process.
 
