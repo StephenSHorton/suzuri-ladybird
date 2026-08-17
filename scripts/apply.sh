@@ -93,6 +93,85 @@ print("patched", p)
 PY
 fi
 
+win_mm="$dest/UI/AppKit/Interface/LadybirdWebViewWindow.mm"
+if ! grep -q "SUZURI_GUEST_PORT" "$win_mm"; then
+  python3 - "$win_mm" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+old = """- (void)setIsVisible:(BOOL)flag
+{
+    [self.web_view handleVisibility:flag];
+    [super setIsVisible:flag];
+}
+
+- (void)setIsMiniaturized:(BOOL)flag
+{
+    [self.web_view handleVisibility:!flag];
+    [super setIsMiniaturized:flag];
+}
+"""
+new = """- (void)setIsVisible:(BOOL)flag
+{
+    if (getenv("SUZURI_GUEST_PORT") != nullptr)
+        flag = YES;
+    [self.web_view handleVisibility:flag];
+    [super setIsVisible:flag];
+}
+
+- (void)setIsMiniaturized:(BOOL)flag
+{
+    if (getenv("SUZURI_GUEST_PORT") != nullptr) {
+        [self.web_view handleVisibility:YES];
+        [super setIsMiniaturized:flag];
+        return;
+    }
+    [self.web_view handleVisibility:!flag];
+    [super setIsMiniaturized:flag];
+}
+"""
+if old not in t:
+    raise SystemExit("LadybirdWebViewWindow.mm: visibility setters not found — rebase overlay")
+if "<cstdlib>" not in t:
+    t = t.replace(
+        "#import <Interface/LadybirdWebViewWindow.h>\n",
+        "#import <Interface/LadybirdWebViewWindow.h>\n#include <cstdlib>\n",
+        1,
+    )
+p.write_text(t.replace(old, new, 1))
+print("patched", p)
+PY
+fi
+
+del_mm="$dest/UI/AppKit/Application/ApplicationDelegate.mm"
+if ! grep -q "SUZURI_GUEST_PORT" "$del_mm"; then
+  python3 - "$del_mm" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+t = p.read_text()
+old = """- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender
+{
+    return [(Application*)sender confirmStopActiveDownloads];
+}
+"""
+new = """- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender
+{
+    if (getenv("SUZURI_GUEST_PORT") != nullptr)
+        return NO;
+    return [(Application*)sender confirmStopActiveDownloads];
+}
+"""
+if old not in t:
+    raise SystemExit("ApplicationDelegate.mm: last-window handler not found — rebase overlay")
+if "<cstdlib>" not in t:
+    t = "#include <cstdlib>\n" + t
+p.write_text(t.replace(old, new, 1))
+print("patched", p)
+PY
+fi
+
 tabc="$dest/UI/AppKit/Interface/TabController.mm"
 if ! grep -q "SUZURI_GUEST_PORT" "$tabc"; then
   python3 - "$tabc" <<'PY'

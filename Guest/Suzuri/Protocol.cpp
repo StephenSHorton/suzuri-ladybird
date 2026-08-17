@@ -158,8 +158,16 @@ void Session::send_busy(bool busy)
 void Session::send_surface(Framebuffer const& fb)
 {
     std::ostringstream o;
-    o << "{\"type\":\"surface\",\"path\":\"" << json_escape(fb.path)
+    o << "{\"type\":\"surface\",\"kind\":\"file\",\"path\":\"" << json_escape(fb.path)
       << "\",\"width\":" << fb.width << ",\"height\":" << fb.height << "}";
+    write_line(o.str());
+}
+
+void Session::send_iosurface(std::uint64_t id, std::uint32_t width, std::uint32_t height, std::uint32_t seq)
+{
+    std::ostringstream o;
+    o << "{\"type\":\"surface\",\"kind\":\"iosurface\",\"id\":" << id
+      << ",\"width\":" << width << ",\"height\":" << height << ",\"seq\":" << seq << "}";
     write_line(o.str());
 }
 

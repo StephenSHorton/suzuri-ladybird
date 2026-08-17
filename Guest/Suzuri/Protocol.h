@@ -58,6 +58,7 @@ public:
     void send_url(std::string const& text);
     void send_busy(bool busy);
     void send_surface(Framebuffer const& fb);
+    void send_iosurface(std::uint64_t id, std::uint32_t width, std::uint32_t height, std::uint32_t seq);
     void send_crash(std::string const& message);
 
     // Blocking read of one JSON line. Returns false on EOF.

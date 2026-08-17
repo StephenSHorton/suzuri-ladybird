@@ -12,6 +12,9 @@
 #include <LibWeb/Page/InputEvent.h>
 #include <LibWeb/UIEvents/KeyCode.h>
 #include <LibWeb/UIEvents/MouseButton.h>
+#include <AK/Optional.h>
+#include <AK/Types.h>
+#include <LibWeb/HTML/VisibilityState.h>
 #include <LibWebView/ViewImplementation.h>
 
 #include <algorithm>
@@ -33,7 +36,8 @@
 #endif
 
 // One long-lived Ladybird. Socket thread owns TCP. AppKit work is on the
-// main queue. Viewport pixels go into SZFB — no extra process, no full PNG.
+// main queue. The compositor already paints an IOSurface; chrome samples it.
+// There is no user-facing Ladybird window.
 
 namespace {
 
@@ -55,47 +59,23 @@ struct GuestRuntime {
     std::chrono::steady_clock::time_point resizing_until {};
     std::chrono::steady_clock::time_point last_viewport {};
     bool viewport_pending { false };
+    std::uint32_t surface_seq { 0 };
+    std::uint64_t last_iosurface_id { 0 };
 };
 
 GuestRuntime g_rt;
 bool g_is_guest { false };
 
 Tab* active_tab();
+Ladybird::WebViewBridge* bridge_for(Tab* tab);
 
-// Covered by Suzuri chrome so it is not a second browser, but still on a
-// real display so WebContent composites. Off-screen + occlusion = blank well.
-void park_under_host(NSWindow* window, CGFloat css_w, CGFloat css_h, bool restack)
+void pin_page_visible(Tab* tab)
 {
-    CGWindowID host = kCGNullWindowID;
-    CGRect host_b {};
-    CFArrayRef info = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID);
-    for (NSDictionary* w in (__bridge NSArray*)info) {
-        NSString* owner = w[(id)kCGWindowOwnerName];
-        if (![owner isEqualToString:@"suzuri-chrome"] && ![owner isEqualToString:@"suzuri"])
-            continue;
-        host = (CGWindowID)[w[(id)kCGWindowNumber] unsignedIntValue];
-        CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)w[(id)kCGWindowBounds], &host_b);
-        if ([owner isEqualToString:@"suzuri-chrome"])
-            break;
-    }
-    if (info)
-        CFRelease(info);
-
-    auto w = std::max(css_w, 1.0);
-    auto h = std::max(css_h, 1.0);
-    if (host != kCGNullWindowID) {
-        NSScreen* screen = [NSScreen mainScreen];
-        CGFloat sh = NSMaxY(screen.frame);
-        CGFloat x = host_b.origin.x + 12;
-        CGFloat y = sh - (host_b.origin.y + host_b.size.height) + 56;
-        NSRect want = NSMakeRect(x, y, w, h);
-        if (!NSEqualRects(NSIntegralRect([window frame]), NSIntegralRect(want)))
-            [window setFrame:want display:NO];
-        if (restack)
-            [window orderWindow:NSWindowBelow relativeTo:static_cast<NSInteger>(host)];
-    } else {
-        [window setFrame:NSMakeRect(-20000, -20000, w, h) display:NO];
-    }
+    if (tab == nil)
+        return;
+    [tab.web_view handleVisibility:YES];
+    if (auto* bridge = bridge_for(tab))
+        bridge->set_system_visibility_state(Web::HTML::VisibilityState::Visible);
 }
 
 void hide_guest_window(NSWindow* window)
@@ -107,17 +87,13 @@ void hide_guest_window(NSWindow* window)
     [window setExcludedFromWindowsMenu:YES];
     [window setHasShadow:NO];
     [window setIgnoresMouseEvents:YES];
-    [window setAlphaValue:1];
-    // Below Suzuri so a leftover 800×600 cannot float as a gray slab.
-    [window setLevel:NSNormalWindowLevel - 1];
     [window setCollectionBehavior:NSWindowCollectionBehaviorTransient
             | NSWindowCollectionBehaviorIgnoresCycle
-            | NSWindowCollectionBehaviorStationary
-            | NSWindowCollectionBehaviorCanJoinAllSpaces];
-    auto frame = [window frame];
-    auto w = frame.size.width > 80 ? frame.size.width : 800;
-    auto h = frame.size.height > 80 ? frame.size.height : 600;
-    park_under_host(window, w, h, true);
+            | NSWindowCollectionBehaviorStationary];
+    [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
+    // Not a presenter. Visibility is pinned in guest mode so orderOut
+    // does not mark the document Hidden.
+    [window orderOut:nil];
 }
 
 void hide_all_guest_windows()
@@ -137,8 +113,7 @@ void hide_all_guest_windows()
             [window orderOut:nil];
         }
     }
-    if (auto* tab = active_tab())
-        [tab.web_view handleVisibility:YES];
+    pin_page_visible(active_tab());
 }
 
 __attribute__((format(printf, 1, 2)))
@@ -154,13 +129,6 @@ void slog(char const* fmt, ...)
     va_end(ap);
     std::fputc('\n', f);
     std::fclose(f);
-}
-
-void send_surface()
-{
-    if (!g_rt.session || g_rt.fb.path.empty())
-        return;
-    g_rt.session->send_surface(g_rt.fb);
 }
 
 bool is_internal_url(std::string const& url)
@@ -249,12 +217,21 @@ void tune_guest_window(Tab* tab)
 
     [window setContentSize:NSMakeSize(css_w, css_h)];
     hide_guest_window(window);
-    park_under_host(window, css_w, css_h, true);
-    [web_view handleVisibility:YES];
+    pin_page_visible(tab);
 
     if (auto* bridge = bridge_for(tab)) {
         bridge->set_system_visibility_state(Web::HTML::VisibilityState::Visible);
         bridge->set_viewport_rect(Gfx::IntRect { 0, 0, css_w, css_h });
+        if (auto* screen = [NSScreen mainScreen]) {
+            u64 fps = 60;
+            if ([screen respondsToSelector:@selector(maximumFramesPerSecond)])
+                fps = static_cast<u64>(std::max<NSInteger>(1, screen.maximumFramesPerSecond));
+            NSNumber* num = screen.deviceDescription[@"NSScreenNumber"];
+            AK::Optional<u64> display_id;
+            if (num)
+                display_id = static_cast<u64>(num.unsignedIntValue);
+            bridge->set_display_metadata(fps, display_id);
+        }
     }
 
     g_rt.window_tuned = true;
@@ -277,8 +254,7 @@ void cover_guest_window()
         return;
     int css_w = 1, css_h = 1;
     guest_css_size(css_w, css_h);
-    if (auto* window = [tab.web_view window])
-        park_under_host(window, css_w, css_h, false);
+    pin_page_visible(tab);
 }
 
 void commit_guest_viewport()
@@ -289,12 +265,10 @@ void commit_guest_viewport()
         return;
     int css_w = 1, css_h = 1;
     guest_css_size(css_w, css_h);
-    if (auto* window = [tab.web_view window]) {
+    if (auto* window = [tab.web_view window])
         [window setContentSize:NSMakeSize(css_w, css_h)];
-        park_under_host(window, css_w, css_h, false);
-    }
     bridge->set_viewport_rect(Gfx::IntRect { 0, 0, css_w, css_h });
-    [tab.web_view handleVisibility:YES];
+    pin_page_visible(tab);
     g_rt.last_viewport = std::chrono::steady_clock::now();
     g_rt.viewport_pending = false;
 }
@@ -303,71 +277,43 @@ bool blit_viewport(bool throttle = true)
 {
     auto* tab = active_tab();
     auto* bridge = bridge_for(tab);
-    if (!bridge || g_rt.fb.path.empty() || g_rt.fb.width == 0 || g_rt.fb.height == 0)
+    if (!bridge)
         return false;
-    // Keep the well empty until our URL is in flight — no new-tab flash.
     if (g_rt.url.empty() || is_internal_url(g_rt.url) || !g_rt.load_issued)
+        return false;
+    if (!g_rt.session)
         return false;
 
     auto now = std::chrono::steady_clock::now();
     bool scrolling = now < g_rt.scrolling_until;
-    // Compositor frames and live scrolling skip the idle throttle.
     if (throttle && !scrolling && !g_rt.force_blit && g_rt.last_blit.time_since_epoch().count() != 0
-        && now - g_rt.last_blit < std::chrono::milliseconds(33))
+        && now - g_rt.last_blit < std::chrono::milliseconds(8))
         return false;
 
     auto paintable = bridge->paintable();
     if (!paintable.has_value() || !paintable->shared_image_buffer)
         return false;
-    auto bitmap = paintable->shared_image_buffer->bitmap_if_present();
-    if (!bitmap)
+
+    auto* surf = static_cast<IOSurfaceRef>(
+        paintable->shared_image_buffer->iosurface_handle().core_foundation_pointer());
+    if (!surf)
         return false;
 
-    auto* dest = Suzuri::map_pixels(g_rt.fb);
-    if (!dest)
+    auto const id = static_cast<std::uint64_t>(IOSurfaceGetID(surf));
+    auto const w = static_cast<std::uint32_t>(IOSurfaceGetWidth(surf));
+    auto const h = static_cast<std::uint32_t>(IOSurfaceGetHeight(surf));
+    if (id == 0 || w == 0 || h == 0)
         return false;
 
-    auto* surf = static_cast<IOSurfaceRef>(paintable->shared_image_buffer->iosurface_handle().core_foundation_pointer());
-    if (surf)
-        IOSurfaceLock(surf, kIOSurfaceLockReadOnly, nullptr);
-
-    auto const dst_w = static_cast<int>(g_rt.fb.width);
-    auto const dst_h = static_cast<int>(g_rt.fb.height);
-    auto const src_w = bitmap->width();
-    auto const src_h = bitmap->height();
-    auto const copy_w = std::min(dst_w, src_w);
-    auto const copy_h = std::min(dst_h, src_h);
-    if (copy_w <= 0 || copy_h <= 0) {
-        if (surf)
-            IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, nullptr);
-        return false;
-    }
-
-    auto const row_bytes = static_cast<std::size_t>(copy_w) * 4;
-    std::uint32_t hash = 2166136261u;
-    for (int y = 0; y < copy_h; ++y) {
-        auto const* src = bitmap->scanline_u8(y);
-        if (!src)
-            continue;
-        std::memcpy(dest + static_cast<std::size_t>(y) * dst_w * 4, src, row_bytes);
-        if ((y & 15) == 0) {
-            auto const* px32 = reinterpret_cast<std::uint32_t const*>(src);
-            hash ^= px32[0] ^ px32[static_cast<unsigned>(copy_w / 2)]
-                ^ px32[static_cast<unsigned>(copy_w - 1)];
-        }
-    }
-
-    if (surf)
-        IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, nullptr);
-
-    if (!scrolling && !g_rt.force_blit && hash == g_rt.blit_hash)
+    if (!scrolling && !g_rt.force_blit && id == g_rt.last_iosurface_id
+        && g_rt.last_blit.time_since_epoch().count() != 0)
         return false;
 
-    Suzuri::publish_szfb(g_rt.fb);
-    g_rt.blit_hash = hash;
+    ++g_rt.surface_seq;
+    g_rt.last_iosurface_id = id;
     g_rt.force_blit = false;
     g_rt.last_blit = now;
-    send_surface();
+    g_rt.session->send_iosurface(id, w, h, g_rt.surface_seq);
     return true;
 }
 
@@ -509,10 +455,6 @@ void navigate(std::string url)
         if (!is_internal_url(g_rt.url))
             g_rt.session->send_url(g_rt.url);
     }
-    if (!g_rt.window_tuned && !g_rt.fb.path.empty()) {
-        Suzuri::paint_placeholder(g_rt.fb, g_rt.url);
-        send_surface();
-    }
     ensure_view();
     if (!g_rt.load_issued && g_rt.session)
         g_rt.session->send_busy(false);
@@ -528,9 +470,8 @@ void scroll_by(Suzuri::HostMessage const& msg)
         return;
 
     // Native Ladybird sends device px; wheel delta stays CSS points.
-    double dpr = g_rt.scale > 0.5 ? static_cast<double>(g_rt.scale) : 1.0;
-    int x = static_cast<int>(std::lround(msg.rect.x * dpr));
-    int y = static_cast<int>(std::lround(msg.rect.y * dpr));
+    int x = static_cast<int>(std::lround(msg.rect.x));
+    int y = static_cast<int>(std::lround(msg.rect.y));
     if (x == 0 && y == 0) {
         x = std::max(1, static_cast<int>(g_rt.fb.width / 2));
         y = std::max(1, static_cast<int>(g_rt.fb.height / 2));
@@ -572,12 +513,12 @@ void pointer_at(Suzuri::HostMessage const& msg)
     if (type == Web::MouseEvent::Type::MouseMove && msg.buttons == 0)
         button = Web::UIEvents::MouseButton::None;
 
-    double dpr = g_rt.scale > 0.5 ? static_cast<double>(g_rt.scale) : 1.0;
     Web::MouseEvent event;
     event.type = type;
+    // enqueue_input_event scales widget (CSS) points to device pixels.
     event.position = {
-        static_cast<int>(std::lround(msg.rect.x * dpr)),
-        static_cast<int>(std::lround(msg.rect.y * dpr)),
+        static_cast<int>(std::lround(msg.rect.x)),
+        static_cast<int>(std::lround(msg.rect.y)),
     };
     event.screen_position = event.position;
     event.button = button;
@@ -694,9 +635,7 @@ void start_timer()
         bool resizing = now < g_rt.resizing_until;
         if (g_rt.viewport_pending && !resizing)
             commit_guest_viewport();
-        // Restacking mid-scroll/resize hitches the well. Idle only.
-        if (!scrolling && !resizing)
-            hide_all_guest_windows();
+        pin_page_visible(active_tab());
         if (g_rt.load_issued)
             blit_viewport(!scrolling && !resizing);
     });
@@ -721,19 +660,8 @@ void prepare_appkit()
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification*) {
-                        hide_all_guest_windows();
+                        pin_page_visible(active_tab());
                     }];
-        auto shove_back = ^(NSNotification*) {
-            hide_all_guest_windows();
-        };
-        [nc addObserverForName:NSWindowDidBecomeKeyNotification
-                        object:nil
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:shove_back];
-        [nc addObserverForName:NSWindowDidBecomeMainNotification
-                        object:nil
-                         queue:[NSOperationQueue mainQueue]
-                    usingBlock:shove_back];
     }
     start_timer();
     ensure_view();
